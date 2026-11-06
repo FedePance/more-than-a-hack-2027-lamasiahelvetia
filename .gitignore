@@ -1,0 +1,10 @@
+data/
+*.mp4
+*.mkv
+*.csv.gz
+results/*.csv
+!results/.gitkeep
+__pycache__/
+*.py[cod]
+.venv/
+venv/
