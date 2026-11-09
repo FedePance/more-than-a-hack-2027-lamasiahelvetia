@@ -1,0 +1,35 @@
+# Core: what the official scorer and starter baseline need
+numpy
+pandas
+pyarrow                # fast parquet caching of the parsed ATD (199k frames x 46 slots)
+
+# Starter tooling (pinned as in the challenge's requirements-starter.txt)
+kloppy==3.18.0         # loads Metrica FIFA/EPTS ATD (xml + txt)
+lxml                   # Smart Tagging / ATD metadata XML
+
+# Modelling: features -> per-frame classifier -> temporal smoothing
+scipy                  # signal filtering, interpolation of ball gaps, linear_sum_assignment for ID switches
+scikit-learn
+lightgbm
+xgboost
+hmmlearn               # HMM / Viterbi smoothing -> whole possession spells (spellF1)
+ruptures               # change-point detection for possession segment boundaries
+numba                  # fast per-frame loops (nearest player, kinematics)
+
+# Video & geometry (homography, frame inspection)
+opencv-python-headless
+imageio[ffmpeg]
+
+# Visualisation
+matplotlib
+seaborn
+plotly
+mplsoccer              # pitch plots for tracking / possession
+
+# Notebooks & utilities
+notebook
+ipykernel
+ipywidgets
+tqdm
+ruff
+pytest

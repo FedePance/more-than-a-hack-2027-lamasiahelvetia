@@ -1,0 +1,70 @@
+{
+  "name": "La MasIA Helvetia - MTAH 2027",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+
+  // Larger shared memory for PyTorch DataLoaders / video decoding.
+  "runArgs": ["--shm-size=4g"],
+
+  "containerEnv": {
+    "MTAH_DATA_DIR": "${containerWorkspaceFolder}/data",
+    "PYTHONPATH": "${containerWorkspaceFolder}"
+  },
+
+  // Non-root user; on Linux hosts its UID/GID is remapped to yours so files
+  // created in the mounted workspace are not owned by root.
+  "remoteUser": "vscode",
+  "updateRemoteUserUID": true,
+
+  // Default virtual environment is baked into the image at /opt/venv.
+  // This only re-syncs it if requirements.txt changed since the image was built.
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+  "features": {
+    "ghcr.io/devcontainers/features/git-lfs:1": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/venv/bin/python",
+        "python.terminal.activateEnvironment": true,
+        "jupyter.notebookFileRoot": "${workspaceFolder}",
+        "files.watcherExclude": {
+          "**/data/**": true,
+          "**/.venv/**": true
+        },
+        "search.exclude": {
+          "**/data/**": true,
+          "**/.venv/**": true
+        }
+      },
+      "extensions": [
+        // Python
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.debugpy",
+        "ms-python.vscode-python-envs",
+
+        // Jupyter
+        "ms-toolsai.jupyter",
+        "ms-toolsai.jupyter-keymap",
+        "ms-toolsai.jupyter-renderers",
+        "ms-toolsai.vscode-jupyter-cell-tags",
+        "ms-toolsai.vscode-jupyter-slideshow",
+        "google.colab",
+
+        // Collaboration
+        "ms-vsliveshare.vsliveshare",
+        "anthropic.claude-code",
+
+        // Markdown
+        "yzhang.markdown-all-in-one",
+        "shd101wyy.markdown-preview-enhanced"
+      ]
+    }
+  }
+}

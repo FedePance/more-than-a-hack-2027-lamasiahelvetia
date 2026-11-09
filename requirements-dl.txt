@@ -1,0 +1,8 @@
+# Optional, heavy (~2+ GB): only if you go after the video itself,
+# e.g. detecting the ball on the ~43% of frames where the tracking has none.
+# CPU wheels by default; for an NVIDIA GPU see https://pytorch.org/get-started/locally/
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+ultralytics            # YOLO detection / tracking of ball and players
+supervision            # detection utilities, annotators, ByteTrack

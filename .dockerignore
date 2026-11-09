@@ -1,0 +1,4 @@
+# Keep the build context tiny: the image only needs requirements.txt.
+# Without this, the multi-GB match videos in data/ would be sent to Docker on every build.
+*
+!requirements.txt
