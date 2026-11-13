@@ -1,18 +1,21 @@
 """Data loader utilities for the 'More Than A Hack 2027' possession pipeline.
 
-Provides fast, streaming extraction of raw Automatic Tracking Data (ATD) and Smart Tagging
-annotations with zero heavy external dependencies.
+Delegates frame alignment and asset resolution to official starter tooling (starter/load_atd.py)
+and provides fast streaming extraction of raw Automatic Tracking Data (ATD) into structured numpy
+arrays, including goalkeeper and non-outfield role filtering.
 """
 
 from dataclasses import dataclass
-import os
 from pathlib import Path
-import xml.etree.ElementTree as ET
 from typing import Optional, Tuple, List, Dict, Any
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
-# Domain constants
+# Official starter loaders and constants
+from starter.load_atd import video_frame_of, atd_paths
+from games import GAME, DEFAULT_SOURCE
+
 HOME_CODE = 0
 AWAY_CODE = 1
 FIELD_SEP = ":"
@@ -25,42 +28,95 @@ class RawTrackingData:
     """Container for parsed match tracking arrays."""
     n_frames: int
     pitch: Tuple[float, float]
-    team_of_track: np.ndarray        # shape (46,), int8 (0 = Home, 1 = Away)
+    team_of_track: np.ndarray        # shape (n_slots,), int8 (0 = Home, 1 = Away)
     team_names: Tuple[str, str]      # (Home name, Away name)
+    is_outfield_slot: np.ndarray     # shape (n_slots,), bool (True for outfield players)
     ball_xy: np.ndarray              # shape (n_frames, 2), float32 in metres (NaN if missing)
     ball_speed: np.ndarray           # shape (n_frames,), float32 in m/s (NaN if missing)
-    player_xy: np.ndarray            # shape (n_frames, 46, 2), float32 in metres (NaN if missing)
-    player_speed: np.ndarray         # shape (n_frames, 46), float32 in m/s (NaN if missing)
-    mean_player_speed: np.ndarray    # shape (n_frames,), float32 in m/s (collective mean)
+    player_xy: np.ndarray            # shape (n_frames, n_slots, 2), float32 in metres (NaN if missing)
+    player_speed: np.ndarray         # shape (n_frames, n_slots), float32 in m/s (NaN if missing)
+    mean_player_speed: np.ndarray    # shape (n_frames,), float32 in m/s (mean of active outfield players)
+    p80_player_speed: np.ndarray     # shape (n_frames,), float32 in m/s (80th percentile outfield speed)
 
 
-def parse_atd_metadata(meta_path: Path) -> Tuple[np.ndarray, Tuple[str, str]]:
-    """Parse FIFA/EPTS XML metadata to extract track slot team assignments and club names.
+def parse_atd_metadata(meta_path: Path) -> Tuple[np.ndarray, Tuple[str, str], np.ndarray]:
+    """Parse FIFA/EPTS XML metadata to extract track slot team assignments, club names, and roles.
+
+    Follows the EPTS metadata standard:
+    - Inspects MatchParameters.Score for idLocalTeam (Home) and idVisitingTeam (Away)
+    - Fallback: first Team element in XML is Home (FIFA/EPTS convention)
+    - Identifies Goalkeeper and non-outfield slots (position_index == 0 or name tags)
 
     Args:
         meta_path: Path to the ATD metadata XML file.
 
     Returns:
-        Tuple of (team_of_track array, (home_name, away_name)).
+        Tuple of (team_of_track, (home_name, away_name), is_outfield_slot).
     """
     root = ET.parse(meta_path).getroot()
-    teams = list(root.iter("Team"))
-    if len(teams) < 2:
-        raise ValueError(f"Expected at least 2 teams in metadata {meta_path}, found {len(teams)}")
 
-    home_id = teams[0].get("id")
-    home_name = teams[0].findtext("Name") or "Home"
-    away_name = teams[1].findtext("Name") or "Away"
+    # Extract team IDs and names
+    team_elements = list(root.iter("Team"))
+    if len(team_elements) < 2:
+        raise ValueError(f"Expected at least 2 teams in metadata {meta_path}, found {len(team_elements)}")
 
-    slots = [player.get("teamId") for player in root.iter("Player")]
-    if not slots:
-        raise ValueError(f"No player slots defined in {meta_path}")
+    team_name_map = {}
+    team_ids = []
+    for team_elm in team_elements:
+        tid = team_elm.get("id")
+        tname = team_elm.findtext("Name") or f"Team_{tid}"
+        team_ids.append(tid)
+        team_name_map[tid] = tname
 
-    team_of_track = np.array(
-        [HOME_CODE if slot_team == home_id else AWAY_CODE for slot_team in slots],
-        dtype=np.int8,
-    )
-    return team_of_track, (home_name, away_name)
+    # Determine Home team ID from Score element if available
+    home_id = None
+    away_id = None
+    for score_elm in root.iter("Score"):
+        local_id = score_elm.get("idLocalTeam")
+        visiting_id = score_elm.get("idVisitingTeam")
+        if local_id and visiting_id:
+            home_id = local_id
+            away_id = visiting_id
+            break
+
+    # Fallback to team order
+    if home_id is None:
+        home_id = team_ids[0]
+        away_id = team_ids[1]
+
+    home_name = team_name_map.get(home_id, "Home")
+    away_name = team_name_map.get(away_id, "Away")
+
+    player_elements = list(root.iter("Player"))
+    if not player_elements:
+        raise ValueError(f"No player elements found in metadata {meta_path}")
+
+    n_slots = len(player_elements)
+    team_of_track = np.full(n_slots, AWAY_CODE, dtype=np.int8)
+    is_outfield_slot = np.ones(n_slots, dtype=bool)
+
+    for slot_idx, player_elm in enumerate(player_elements):
+        tid = player_elm.get("teamId")
+        if tid == home_id:
+            team_of_track[slot_idx] = HOME_CODE
+        else:
+            team_of_track[slot_idx] = AWAY_CODE
+
+        # Role detection: check ProviderParameter for position_index == 0 (Goalkeeper)
+        # or name containing Goalkeeper / GK / Referee
+        name = (player_elm.findtext("Name") or "").lower()
+        if "goalkeeper" in name or "gk" in name or "referee" in name or "ref" in name:
+            is_outfield_slot[slot_idx] = False
+
+        for param in player_elm.iter("ProviderParameter"):
+            p_name = (param.findtext("Name") or "").lower()
+            p_val = (param.findtext("Value") or "").strip()
+            if p_name == "position_index" and p_val == "0":
+                is_outfield_slot[slot_idx] = False
+            elif p_name == "role" and ("goalkeeper" in p_val.lower() or "referee" in p_val.lower()):
+                is_outfield_slot[slot_idx] = False
+
+    return team_of_track, (home_name, away_name), is_outfield_slot
 
 
 def load_raw_tracking_data(
@@ -71,7 +127,8 @@ def load_raw_tracking_data(
 ) -> RawTrackingData:
     """Stream raw ATD text file directly into structured numpy arrays.
 
-    Coordinates are scaled to metres using the provided pitch dimensions (length, width).
+    Delegates frame alignment to starter/load_atd.py.video_frame_of so tracking
+    frames precisely align with games.py half_video_blocks and Smart Tagging.
 
     Args:
         raw_path: Path to the raw ATD text file.
@@ -82,7 +139,7 @@ def load_raw_tracking_data(
     Returns:
         Populated RawTrackingData container.
     """
-    team_of_track, team_names = parse_atd_metadata(meta_path)
+    team_of_track, team_names, is_outfield_slot = parse_atd_metadata(meta_path)
     n_slots = len(team_of_track)
     pitch_length, pitch_width = pitch
 
@@ -99,7 +156,7 @@ def load_raw_tracking_data(
                 continue
 
             frame_id = int(parts[0])
-            frame_idx = frame_id - 1  # 1-indexed in file to 0-indexed in video frames
+            frame_idx = video_frame_of(frame_id)
             if frame_idx < 0 or frame_idx >= n_expected_frames:
                 continue
 
@@ -128,20 +185,40 @@ def load_raw_tracking_data(
                             player_xy[frame_idx, slot_idx, 1] = float(group[c1 + 1 : c2]) * pitch_width
                             player_speed[frame_idx, slot_idx] = float(group[c2 + 1 :])
 
-    # Compute collective mean speed per frame across active outfield players
-    with np.errstate(invalid="ignore"):
-        mean_player_speed = np.nanmean(player_speed, axis=1).astype(np.float32)
-    # Replace all-NaN rows with 0.0
-    mean_player_speed = np.nan_to_num(mean_player_speed, nan=0.0)
+    # Outfield slot mask: if no slots were marked non-outfield by metadata,
+    # find goalkeepers empirically (players who stay in goal area x < 12 or x > pitch_length - 12)
+    outfield_indices = np.flatnonzero(is_outfield_slot)
+    if len(outfield_indices) == n_slots and n_slots >= 22:
+        # Detect goalkeepers by median x position near goal lines
+        with np.errstate(invalid="ignore"):
+            median_x = np.nanmedian(player_xy[:, :, 0], axis=0)
+        potential_gk = np.flatnonzero((median_x < 14.0) | (median_x > pitch_length - 14.0))
+        if len(potential_gk) >= 2:
+            is_outfield_slot[potential_gk] = False
+            outfield_indices = np.flatnonzero(is_outfield_slot)
+
+    # Compute collective outfield player speed statistics (mean and 80th percentile)
+    outfield_speeds = player_speed[:, outfield_indices]
+    mean_player_speed = np.zeros(n_expected_frames, dtype=np.float32)
+    p80_player_speed = np.zeros(n_expected_frames, dtype=np.float32)
+
+    for i in range(n_expected_frames):
+        row = outfield_speeds[i]
+        valid_speeds = row[~np.isnan(row)]
+        if len(valid_speeds) > 0:
+            mean_player_speed[i] = float(np.mean(valid_speeds))
+            p80_player_speed[i] = float(np.percentile(valid_speeds, 80))
 
     return RawTrackingData(
         n_frames=n_expected_frames,
         pitch=pitch,
         team_of_track=team_of_track,
         team_names=team_names,
+        is_outfield_slot=is_outfield_slot,
         ball_xy=ball_xy,
         ball_speed=ball_speed,
         player_xy=player_xy,
         player_speed=player_speed,
         mean_player_speed=mean_player_speed,
+        p80_player_speed=p80_player_speed,
     )

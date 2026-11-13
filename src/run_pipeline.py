@@ -7,9 +7,9 @@ Match: FC Barcelona vs Athletic Club (BAR-ATH)
 Executes end-to-end:
 1. Asset resolution via games.py and MTAH_DATA_DIR (fallback to ./data)
 2. Streaming raw tracking and Smart Tagging loading
-3. Ball trajectory reconstruction and ambiguity flagging (src/ball_tracking.py)
-4. Dead ball detection combining Smart Tagging and player kinematics (src/dead_ball.py)
-5. Temporal hysteresis possession state machine (src/possession_engine.py)
+3. Ball trajectory reconstruction with Savitzky-Golay and analytic derivatives (src/ball_tracking.py)
+4. Dead ball detection combining Smart Tagging and outfield player kinematics (src/dead_ball.py)
+5. Temporal hysteresis possession state machine with impulse turnover detection (src/possession_engine.py)
 6. Submission export and verification against official format rules
 """
 
@@ -38,6 +38,7 @@ from games import (
     source_frames,
 )
 from starter.load_smart_tagging import load as load_smart_tagging
+from src.config import PipelineConfig
 from src.data_loader import load_raw_tracking_data
 from src.ball_tracking import reconstruct_ball_trajectory
 from src.dead_ball import detect_dead_ball
@@ -63,7 +64,11 @@ def resolve_data_directory(cli_data_dir: str = None) -> Path:
     return (ROOT_DIR / "data").resolve()
 
 
-def count_possession_spells(labels: np.ndarray, half_blocks: List[Tuple[int, int, int]], fps: float = 25.0) -> Tuple[int, float]:
+def count_possession_spells(
+    labels: np.ndarray,
+    half_blocks: List[Tuple[int, int, int]],
+    fps: float = 25.0,
+) -> Tuple[int, float]:
     """Calculate the number and mean duration of live possession spells (maximal runs of H or A).
 
     Excludes dead ball ('D') and bridges abstentions ('X') within each half,
@@ -143,6 +148,7 @@ def run_pipeline(
     output_path: Path,
     game: str = GAME,
     source: str = DEFAULT_SOURCE,
+    config: PipelineConfig = None,
 ) -> pd.DataFrame:
     """Run the complete possession inference pipeline across the match.
 
@@ -151,10 +157,14 @@ def run_pipeline(
         output_path: Path where final submission CSV should be saved.
         game: Match key (default: 'BAR-ATH').
         source: Recording source (default: 'tactical').
+        config: Typed PipelineConfig instance (defaults to PipelineConfig()).
 
     Returns:
         DataFrame with predictions ['frame', 'label'].
     """
+    if config is None:
+        config = PipelineConfig()
+
     start_time = time.perf_counter()
     print("=" * 80)
     print("La MasIA Helvetia - More Than A Hack 2027 Possession Pipeline")
@@ -175,8 +185,8 @@ def run_pipeline(
         )
 
     n_frames = source_frames(source, game)
-    pitch = GAMES[game]["pitch"]
-    fps = GAMES[game]["fps"]
+    pitch = (config.pitch_length, config.pitch_width)
+    fps = config.fps
     half_blocks = half_video_blocks(game)
 
     print(f"\n[1/5] Streaming raw tracking data ({n_frames} frames, pitch {pitch[0]}x{pitch[1]} m)...")
@@ -190,6 +200,8 @@ def run_pipeline(
     print(f"      Loaded tracking. Raw ball observed on {raw_ball_observed}/{n_frames} frames "
           f"({100.0 * raw_ball_observed / n_frames:.1f}%).")
     print(f"      Teams: H = {tracking.team_names[0]}, A = {tracking.team_names[1]}")
+    n_outfield = int(np.sum(tracking.is_outfield_slot))
+    print(f"      Active outfield slots: {n_outfield}/{len(tracking.is_outfield_slot)}")
 
     print("\n[2/5] Loading Smart Tagging annotations...")
     try:
@@ -199,13 +211,15 @@ def run_pipeline(
         print(f"      Warning: Smart Tagging could not be loaded ({e}). Proceeding with kinematics fallback.")
         smart_tagging_events = []
 
-    print("\n[3/5] Reconstructing ball trajectory (interpolating gaps < 35 frames)...")
+    print("\n[3/5] Reconstructing ball trajectory (PCHIP + Savitzky-Golay smoothing)...")
     ball_result = reconstruct_ball_trajectory(
         raw_ball_xy=tracking.ball_xy,
         pitch=pitch,
-        max_gap_frames=35,
-        max_physical_speed_mps=38.0,
+        max_gap_frames=config.max_ball_gap_frames,
+        max_physical_speed_mps=config.max_ball_speed_mps,
         fps=fps,
+        savgol_window=config.savgol_window,
+        savgol_polyorder=config.savgol_polyorder,
     )
     reconstructed_count = int(np.sum(~ball_result.is_ball_uncertain))
     print(f"      Ball trajectory resolved on {reconstructed_count}/{n_frames} frames "
@@ -213,38 +227,48 @@ def run_pipeline(
     print(f"      Uncertain/blackout frames: {n_frames - reconstructed_count} "
           f"({100.0 * (n_frames - reconstructed_count) / n_frames:.1f}%).")
 
-    print("\n[4/5] Detecting Dead Ball ('D') intervals (Smart Tagging + player kinematics)...")
+    print("\n[4/5] Detecting Dead Ball ('D') intervals (Smart Tagging dilation + p80 kinematics)...")
     dead_ball_result = detect_dead_ball(
         n_frames=n_frames,
         mean_player_speed=tracking.mean_player_speed,
+        p80_player_speed=tracking.p80_player_speed,
         ball_xy=ball_result.ball_xy,
         is_ball_uncertain=ball_result.is_ball_uncertain,
         ball_speed=ball_result.ball_speed,
+        player_xy=tracking.player_xy,
         smart_tagging_events=smart_tagging_events,
         half_blocks=half_blocks,
         pitch=pitch,
-        walking_speed_threshold_mps=1.15,
-        kinematics_window=35,
-        min_stoppage_duration_frames=20,
+        jogging_speed_threshold_mps=config.jogging_speed_threshold_mps,
+        kinematic_stoppage_frames=config.kinematic_stoppage_frames,
+        dilation_window_frames=config.dilation_window_frames,
+        min_stoppage_duration_frames=config.min_stoppage_duration_frames,
+        stationary_ball_speed_mps=config.stationary_ball_speed_mps,
+        abandoned_ball_distance_m=config.abandoned_ball_distance_m,
         fps=fps,
     )
     dead_count = int(np.sum(dead_ball_result.is_dead_ball))
     print(f"      Dead Ball detected on {dead_count}/{n_frames} frames ({100.0 * dead_count / n_frames:.1f}%).")
 
-    print("\n[5/5] Running temporal hysteresis possession state machine...")
+    print("\n[5/5] Running temporal hysteresis possession state machine (impulse + selective X)...")
     possession_result = run_possession_state_machine(
         n_frames=n_frames,
         ball_xy=ball_result.ball_xy,
         is_ball_uncertain=ball_result.is_ball_uncertain,
         is_dead_ball=dead_ball_result.is_dead_ball,
+        ball_speed=ball_result.ball_speed,
         player_xy=tracking.player_xy,
         player_speed=tracking.player_speed,
         team_of_track=tracking.team_of_track,
+        team_names=tracking.team_names,
         smart_tagging_events=smart_tagging_events,
         half_blocks=half_blocks,
-        control_radius=1.8,
-        min_control_frames=22,
-        scramble_abstain_frames=15,
+        control_radius=config.control_radius,
+        min_control_frames=config.min_control_frames,
+        scramble_abstain_frames=config.scramble_abstain_frames,
+        impulse_speed_threshold_mps=config.impulse_speed_threshold_mps,
+        impulse_proximity_m=config.impulse_proximity_m,
+        restart_search_frames=config.restart_search_frames,
         fps=fps,
     )
 
