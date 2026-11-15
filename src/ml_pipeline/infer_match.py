@@ -46,7 +46,7 @@ from src.ml_pipeline.features import (
     N_FEATURES,
     extract_frame_features_from_tracking,
 )
-from src.ml_pipeline.models import build_model
+from src.ml_pipeline.models import PossessionLGBM, build_model
 from src.ml_pipeline.viterbi import codes_to_labels, viterbi_decode
 from starter.load_smart_tagging import load as load_smart_tagging_events
 
@@ -54,16 +54,21 @@ from starter.load_smart_tagging import load as load_smart_tagging_events
 def load_model_from_checkpoint(
     checkpoint_path: str | Path,
     device: torch.device,
-) -> nn.Module:
-    """Load model architecture and weights from saved checkpoint file.
+) -> nn.Module | PossessionLGBM:
+    """Load model architecture and weights from saved checkpoint file (.pt or .joblib).
 
-    Inspects ckpt['arch'] and saved hyperparameters, defaulting gracefully
-    if older checkpoint dictionaries omitted them.
+    Supports:
+    - PyTorch sequence models (PossessionBiGRU, PossessionTCN1D) saved as .pt
+    - LightGBM tabular models (PossessionLGBM) saved as .joblib
     """
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    p = Path(checkpoint_path)
+    if p.suffix == ".joblib" or "lgbm" in p.name.lower():
+        return PossessionLGBM.load(p)
+
+    ckpt = torch.load(p, map_location=device)
     arch = ckpt.get("arch")
     if not arch:
-        p_str = str(checkpoint_path).lower()
+        p_str = str(p).lower()
         if "tcn" in p_str:
             arch = "tcn_1d"
         else:
@@ -82,25 +87,27 @@ def load_model_from_checkpoint(
         num_layers=num_layers,
         dropout=dropout,
         num_classes=num_classes,
-    ).to(device)
-
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
+    )
+    if isinstance(model, nn.Module):
+        model = model.to(device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        model.eval()
     return model
 
 
-def predict_half_probabilities(
-    models: list[nn.Module],
-    weights: list[float] | np.ndarray,
+def predict_pytorch_probabilities(
+    model: nn.Module,
     features: np.ndarray,
     device: torch.device,
     seq_len: int = 250,
     stride: int = 125,
     batch_size: int = 64,
 ) -> np.ndarray:
-    """Predict probabilities across a half, computing weighted average across models."""
+    """Predict per-frame softmax probabilities using PyTorch sliding window model."""
+    model.eval()
     n_frames = len(features)
-    weighted_probs = np.zeros((n_frames, 3), dtype=np.float32)
+    accum_logits = np.zeros((n_frames, 3), dtype=np.float32)
+    counts = np.zeros(n_frames, dtype=np.float32)
 
     windows = []
     spans = []
@@ -114,30 +121,51 @@ def predict_half_probabilities(
         windows.append(features[start:end])
         spans.append((start, end))
 
+    with torch.no_grad():
+        for b_start in range(0, len(windows), batch_size):
+            b_end = min(len(windows), b_start + batch_size)
+            batch_data = np.stack(windows[b_start:b_end], axis=0)
+            tensor_x = torch.from_numpy(batch_data).float().to(device)
+            batch_logits = model(tensor_x).cpu().numpy()
+
+            for i, (s, e) in enumerate(spans[b_start:b_end]):
+                accum_logits[s:e] += batch_logits[i]
+                counts[s:e] += 1.0
+
+    counts = np.maximum(counts, 1.0)[:, None]
+    avg_logits = accum_logits / counts
+
+    # Compute per-frame softmax probabilities
+    shift = avg_logits - np.max(avg_logits, axis=-1, keepdims=True)
+    exp_vals = np.exp(shift)
+    return (exp_vals / np.sum(exp_vals, axis=-1, keepdims=True)).astype(np.float32)
+
+
+def predict_half_probabilities(
+    models: list[nn.Module | PossessionLGBM],
+    weights: list[float] | np.ndarray,
+    features: np.ndarray,
+    device: torch.device,
+    seq_len: int = 250,
+    stride: int = 125,
+    batch_size: int = 64,
+) -> np.ndarray:
+    """Predict probabilities across a half, computing weighted average across models."""
+    n_frames = len(features)
+    weighted_probs = np.zeros((n_frames, 3), dtype=np.float32)
+
     for model, w in zip(models, weights):
-        model.eval()
-        accum_logits = np.zeros((n_frames, 3), dtype=np.float32)
-        counts = np.zeros(n_frames, dtype=np.float32)
-
-        with torch.no_grad():
-            for b_start in range(0, len(windows), batch_size):
-                b_end = min(len(windows), b_start + batch_size)
-                batch_data = np.stack(windows[b_start:b_end], axis=0)
-                tensor_x = torch.from_numpy(batch_data).float().to(device)
-                batch_logits = model(tensor_x).cpu().numpy()
-
-                for i, (s, e) in enumerate(spans[b_start:b_end]):
-                    accum_logits[s:e] += batch_logits[i]
-                    counts[s:e] += 1.0
-
-        counts = np.maximum(counts, 1.0)[:, None]
-        avg_logits = accum_logits / counts
-
-        # Compute per-frame softmax probabilities
-        shift = avg_logits - np.max(avg_logits, axis=-1, keepdims=True)
-        exp_vals = np.exp(shift)
-        m_probs = exp_vals / np.sum(exp_vals, axis=-1, keepdims=True)
-
+        if isinstance(model, PossessionLGBM):
+            m_probs = model.predict_proba(features)
+        else:
+            m_probs = predict_pytorch_probabilities(
+                model=model,
+                features=features,
+                device=device,
+                seq_len=seq_len,
+                stride=stride,
+                batch_size=batch_size,
+            )
         weighted_probs += float(w) * m_probs
 
     return weighted_probs
@@ -148,11 +176,13 @@ def main():
     parser.add_argument("--checkpoint", type=str, default="models/bi_gru_full.pt",
                         help="Path to single model checkpoint (used if --checkpoints and --ensemble are not set).")
     parser.add_argument("--checkpoints", nargs="+", type=str, default=None,
-                        help="List of model checkpoint paths for heterogeneous ensemble.")
+                        help="List of model checkpoint paths for heterogeneous ensemble (.pt and/or .joblib).")
     parser.add_argument("--weights", nargs="+", type=float, default=None,
                         help="Optional ensemble weights for --checkpoints (defaults to equal weighting).")
     parser.add_argument("--ensemble", action="store_true",
-                        help="Ensemble across the 3 LOGO fold checkpoints (bi_gru_fold_1/2/3.pt).")
+                        help="Ensemble across the 3 LOGO fold checkpoints.")
+    parser.add_argument("--arch", type=str, default="bi_gru",
+                        help="Architecture family when using --ensemble ('bi_gru', 'tcn_1d', 'lgbm').")
     parser.add_argument("--models-dir", type=str, default="models",
                         help="Directory containing fold checkpoints when --ensemble is set.")
     parser.add_argument("--hybrid-dead-ball", action="store_true",
@@ -245,11 +275,18 @@ def main():
             weights = [1.0 / len(checkpoint_paths)] * len(checkpoint_paths)
     elif args.ensemble:
         models_dir = Path(args.models_dir)
-        checkpoint_paths = [
-            models_dir / "bi_gru_fold_1.pt",
-            models_dir / "bi_gru_fold_2.pt",
-            models_dir / "bi_gru_fold_3.pt",
-        ]
+        if args.arch.lower().strip() in ("lgbm", "lightgbm"):
+            checkpoint_paths = [
+                models_dir / "lgbm_fold_1.joblib",
+                models_dir / "lgbm_fold_2.joblib",
+                models_dir / "lgbm_fold_3.joblib",
+            ]
+        else:
+            checkpoint_paths = [
+                models_dir / f"{args.arch}_fold_1.pt",
+                models_dir / f"{args.arch}_fold_2.pt",
+                models_dir / f"{args.arch}_fold_3.pt",
+            ]
         weights = [1.0 / len(checkpoint_paths)] * len(checkpoint_paths)
     else:
         ckpt_path = Path(args.checkpoint)
