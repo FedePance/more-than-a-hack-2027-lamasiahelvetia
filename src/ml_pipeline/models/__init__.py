@@ -3,8 +3,9 @@
 from torch import nn
 
 from src.ml_pipeline.models.bi_gru import PossessionBiGRU
+from src.ml_pipeline.models.tcn_1d import PossessionTCN1D
 
-SUPPORTED_ARCHITECTURES = ["bi_gru"]
+SUPPORTED_ARCHITECTURES = ["bi_gru", "tcn_1d"]
 
 
 def build_model(
@@ -16,7 +17,7 @@ def build_model(
     """Build and instantiate a sequence model architecture.
 
     Args:
-        arch: Architecture name ('bi_gru', etc.).
+        arch: Architecture name ('bi_gru', 'tcn_1d', etc.).
         input_dim: Number of input features (default: 14).
         num_classes: Target classes (default: 3: H, A, D).
         **kwargs: Additional model parameters (e.g. hidden_size, num_layers, dropout).
@@ -27,9 +28,11 @@ def build_model(
     clean_arch = arch.lower().strip()
     if clean_arch in ("bi_gru", "bigru", "gru"):
         return PossessionBiGRU(input_dim=input_dim, num_classes=num_classes, **kwargs)
+    if clean_arch in ("tcn_1d", "tcn1d", "tcn"):
+        return PossessionTCN1D(input_dim=input_dim, num_classes=num_classes, **kwargs)
     raise ValueError(
         f"Unsupported architecture '{arch}'. Available options: {SUPPORTED_ARCHITECTURES}"
     )
 
 
-__all__ = ["SUPPORTED_ARCHITECTURES", "PossessionBiGRU", "build_model"]
+__all__ = ["SUPPORTED_ARCHITECTURES", "PossessionBiGRU", "PossessionTCN1D", "build_model"]

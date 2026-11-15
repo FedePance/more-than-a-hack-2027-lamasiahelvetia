@@ -4,8 +4,8 @@ Supports:
 1. --mode logo: 3-fold Leave-One-Game-Out cross validation across Metrica Sample Games 1-3.
    Trains on 2 games with fast on-the-fly augmentations and evaluates on the held-out game
    under deterministic 41% synthetic ball dropout using Numba-accelerated Viterbi decoding
-   and official metrics (spell_f1_mean, macro_f1). Saves checkpoints to models/bi_gru_fold_{k}.pt.
-2. --mode full: Trains on all 3 games combined and saves to models/bi_gru_full.pt.
+   and official metrics (spell_f1_mean, macro_f1). Saves checkpoints to models/{arch}_fold_{k}.pt.
+2. --mode full: Trains on all 3 games combined and saves to models/{arch}_full.pt.
 """
 
 import argparse
@@ -259,7 +259,7 @@ def train_single_split(
             optimizer.zero_grad()
             logits = model(x_b)  # (batch, seq_len, 3)
 
-            ce_loss = criterion(logits.view(-1, 3), y_b.view(-1))
+            ce_loss = criterion(logits.reshape(-1, 3), y_b.reshape(-1))
             smooth_loss = temporal_smoothness_loss(logits)
             loss = ce_loss + args.smooth_weight * smooth_loss
 
@@ -380,7 +380,7 @@ def main():
             )
 
             # Save fold checkpoint
-            ckpt_file = output_path / f"bi_gru_{fname}.pt"
+            ckpt_file = output_path / f"{args.arch}_{fname}.pt"
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "arch": args.arch,
@@ -388,6 +388,7 @@ def main():
                 "hidden_size": args.hidden_size,
                 "num_layers": args.num_layers,
                 "dropout": args.dropout,
+                "num_classes": 3,
                 "val_game": val_g.game_id,
                 "val_metrics": metrics,
             }, ckpt_file)
@@ -415,7 +416,7 @@ def main():
             device=device,
             fold_name="full_3_games",
         )
-        ckpt_file = output_path / "bi_gru_full.pt"
+        ckpt_file = output_path / f"{args.arch}_full.pt"
         torch.save({
             "model_state_dict": model.state_dict(),
             "arch": args.arch,
@@ -423,6 +424,7 @@ def main():
             "hidden_size": args.hidden_size,
             "num_layers": args.num_layers,
             "dropout": args.dropout,
+            "num_classes": 3,
         }, ckpt_file)
         print(f"\nSaved full model checkpoint: {ckpt_file}", flush=True)
 
