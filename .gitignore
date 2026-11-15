@@ -7,6 +7,10 @@ data/*
 *.zip
 *.csv.gz
 
+# External open datasets (Metrica Sample Data)
+external_open/
+models/
+
 # Evaluation Outputs & Submissions
 evaluation/scoreboard.csv
 evaluation/reports/
