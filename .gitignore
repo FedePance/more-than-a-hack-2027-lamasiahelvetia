@@ -9,7 +9,7 @@ data/*
 
 # External open datasets (Metrica Sample Data)
 external_open/
-models/
+/models/
 
 # Evaluation Outputs & Submissions
 evaluation/scoreboard.csv
@@ -25,6 +25,7 @@ __pycache__/
 *$py.class
 .ipynb_checkpoints/
 .pytest_cache/
+.ruff_cache/
 
 # Virtual Environments & Local Secrets
 .venv/

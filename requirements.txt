@@ -16,6 +16,10 @@ hmmlearn               # HMM / Viterbi smoothing -> whole possession spells (spe
 ruptures               # change-point detection for possession segment boundaries
 numba                  # fast per-frame loops (nearest player, kinematics)
 
+# Deep Learning (sequence models, CPU wheel ~180 MB)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+
 # Video & geometry (homography, frame inspection)
 opencv-python-headless
 imageio[ffmpeg]
