@@ -32,14 +32,15 @@ class PipelineConfig:
     min_stoppage_duration_frames: int = 20      # 0.8 s minimum duration for valid stoppage
     stationary_ball_speed_mps: float = 0.35     # Ball considered stationary below this speed
     abandoned_ball_distance_m: float = 2.5      # Distance from players to flag stationary ball
+    standalone_stoppage_frames: int = 60        # 2.4 s sustained low speed for standalone D
+    standalone_p80_threshold_mps: float = 1.35  # 80th-percentile outfield player speed threshold for standalone D
 
     # Possession engine & hysteresis state machine
     control_radius: float = 1.8                 # Proximity threshold (m) for player ball control
     min_control_frames: int = 22                # Sustained control duration (~0.88 s) to change possession
     scramble_abstain_frames: int = 15           # Contested duel duration before emitting 'X'
-    impulse_speed_threshold_mps: float = 5.0    # Ball speed indicating clearance/interception impulse
-    impulse_proximity_m: float = 1.6            # Proximity required for one-touch turnover attribution
     restart_search_frames: int = 50             # Forward window (2.0 s) to locate restart taker
+    min_live_spell_frames: int = 35             # 1.4 s at 25 fps: min duration to absorb micro-flips
 
     @property
     def pitch(self) -> Tuple[float, float]:

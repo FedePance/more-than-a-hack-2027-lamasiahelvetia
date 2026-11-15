@@ -3,9 +3,10 @@
 Combines:
 1. Dynamic team name resolution matching EPTS tracking metadata against Smart Tagging tags.
 2. Smart restart attribution prioritizing Smart Tagging 'Team' tags and 50-frame forward search.
-3. Impulse / one-touch turnover detection (proximity <= 1.6 m with ball speed >= 5.0 m/s).
-4. Selective abstention ('X') during unresolved contested scrambles or unestablished restart blackouts,
-   while maintaining established possession during occluded dribbles to protect macroF1 and spellF1.
+3. Pass-preserving possession evidence accumulation (opp_evidence) with free-flight freezing.
+4. Minimum live spell regularization absorbing brief micro-flips (< 35 frames) into the surrounding spell.
+5. Selective abstention ('X') during unresolved contested scrambles or unestablished restart blackouts,
+   while maintaining established possession during occluded dribbles.
 """
 
 from dataclasses import dataclass
@@ -191,6 +192,99 @@ def attribute_restart_possession(
     return None
 
 
+def regularize_live_spells(
+    labels: np.ndarray,
+    half_blocks: List[Tuple[int, int, int]],
+    min_live_spell_frames: int = 35,
+    possessor_history: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Absorb brief H->A->H or A->H->A micro-flips within continuous live-play segments.
+
+    Within each continuous live-play segment (bounded by 'D' frames and half boundaries),
+    absorbs any brief micro-flip lasting fewer than min_live_spell_frames into the
+    surrounding team's possession spell to prevent transient 1-touch clearances from
+    fragmenting ongoing spells.
+
+    Args:
+        labels: Array of frame labels ('H', 'A', 'D', 'X').
+        half_blocks: List of (half, first_frame, last_frame) tuples.
+        min_live_spell_frames: Minimum frames required for a valid possession spell flip (default: 35).
+        possessor_history: Optional array of possessor codes (0=Home, 1=Away) to keep in sync.
+
+    Returns:
+        Regularized labels array.
+    """
+    n_frames = len(labels)
+    for _, first_frame, last_frame in half_blocks:
+        s = max(0, first_frame)
+        e = min(n_frames, last_frame + 1)
+        if s >= e:
+            continue
+
+        half_labels = labels[s:e]
+        is_live = half_labels != LABEL_D
+
+        diffs = np.diff(is_live.astype(np.int8))
+        live_starts = (np.flatnonzero(diffs == 1) + 1).tolist()
+        live_ends = (np.flatnonzero(diffs == -1) + 1).tolist()
+        if is_live[0]:
+            live_starts = [0] + live_starts
+        if is_live[-1]:
+            live_ends = live_ends + [len(is_live)]
+
+        for l_start, l_end in zip(live_starts, live_ends):
+            abs_start = s + l_start
+            abs_end = s + l_end
+            seg = labels[abs_start:abs_end]
+
+            while True:
+                if len(seg) < 3:
+                    break
+
+                run_labels = []
+                run_starts = []
+                run_ends = []
+
+                cur_lbl = seg[0]
+                cur_s = 0
+                for idx in range(1, len(seg)):
+                    if seg[idx] != cur_lbl:
+                        run_labels.append(cur_lbl)
+                        run_starts.append(cur_s)
+                        run_ends.append(idx)
+                        cur_lbl = seg[idx]
+                        cur_s = idx
+                run_labels.append(cur_lbl)
+                run_starts.append(cur_s)
+                run_ends.append(len(seg))
+
+                absorbed = False
+                for r in range(1, len(run_labels) - 1):
+                    prev_l = run_labels[r - 1]
+                    cur_l = run_labels[r]
+                    next_l = run_labels[r + 1]
+                    run_len = run_ends[r] - run_starts[r]
+
+                    if run_len < min_live_spell_frames:
+                        if cur_l == LABEL_A and prev_l == LABEL_H and next_l == LABEL_H:
+                            seg[run_starts[r]:run_ends[r]] = LABEL_H
+                            if possessor_history is not None:
+                                possessor_history[abs_start + run_starts[r]:abs_start + run_ends[r]] = HOME_CODE
+                            absorbed = True
+                            break
+                        elif cur_l == LABEL_H and prev_l == LABEL_A and next_l == LABEL_A:
+                            seg[run_starts[r]:run_ends[r]] = LABEL_A
+                            if possessor_history is not None:
+                                possessor_history[abs_start + run_starts[r]:abs_start + run_ends[r]] = AWAY_CODE
+                            absorbed = True
+                            break
+
+                if not absorbed:
+                    break
+
+    return labels
+
+
 def run_possession_state_machine(
     n_frames: int,
     ball_xy: np.ndarray,
@@ -206,10 +300,10 @@ def run_possession_state_machine(
     control_radius: float = 1.8,
     min_control_frames: int = 22,
     scramble_abstain_frames: int = 15,
-    impulse_speed_threshold_mps: float = 5.0,
-    impulse_proximity_m: float = 1.6,
     restart_search_frames: int = 50,
+    min_live_spell_frames: int = 35,
     fps: float = 25.0,
+    **kwargs,
 ) -> PossessionResult:
     """Execute temporal hysteresis possession state machine across all frames.
 
@@ -228,9 +322,8 @@ def run_possession_state_machine(
         control_radius: Proximity threshold in metres for controlled ball possession (default: 1.8 m).
         min_control_frames: Consecutive frames required for opponent to take possession (default: 22 frames).
         scramble_abstain_frames: Consecutive contested frames before emitting 'X' (default: 15 frames).
-        impulse_speed_threshold_mps: Ball speed threshold for one-touch clearance turnover (default: 5.0 m/s).
-        impulse_proximity_m: Opponent proximity required for impulse turnover (default: 1.6 m).
         restart_search_frames: Forward search window in frames for restart attribution (default: 50 frames).
+        min_live_spell_frames: Minimum frames required for valid possession spell flip (default: 35 frames / 1.4 s).
         fps: Video frame rate.
 
     Returns:
@@ -262,7 +355,7 @@ def run_possession_state_machine(
 
         possession_established = True
         control_streak = 0
-        opp_control_streak = 0
+        opp_evidence = 0
         scramble_streak = 0
         was_dead_previous = True
 
@@ -271,7 +364,7 @@ def run_possession_state_machine(
             if is_dead_ball[t]:
                 labels[t] = LABEL_D
                 possessor_history[t] = current_possessor
-                opp_control_streak = 0
+                opp_evidence = 0
                 scramble_streak = 0
                 control_streak = 0
                 was_dead_previous = True
@@ -295,6 +388,7 @@ def run_possession_state_machine(
                 else:
                     # Unconfirmed restart
                     possession_established = False
+                opp_evidence = 0
 
             d_home = min_dist_home[t]
             d_away = min_dist_away[t]
@@ -312,8 +406,8 @@ def run_possession_state_machine(
                     labels[t] = LABEL_X
 
                 possessor_history[t] = current_possessor
-                opp_control_streak = 0
                 scramble_streak = 0
+                # opp_evidence is frozen during blackout
                 continue
 
             # 4. Ball is tracked: check for actively contested duel / scramble
@@ -330,50 +424,29 @@ def run_possession_state_machine(
                     labels[t] = LABEL_X
                     possessor_history[t] = current_possessor
                     possession_established = False
-                    opp_control_streak = 0
+                    opp_evidence = 0
                     continue
             else:
                 scramble_streak = 0
 
-            # 5. Impulse / One-touch turnover detection (clearance or interception)
-            # Opponent is within 1.6 m, ball speed is high (>= 5.0 m/s), and possessor is separated
-            s_ball = ball_speed[t] if not np.isnan(ball_speed[t]) else 0.0
-            is_impulse_turnover = (
-                (d_opponent <= impulse_proximity_m)
-                and (d_opponent < d_possessor)
-                and (s_ball >= impulse_speed_threshold_mps)
-                and (d_possessor > 1.8)
-            )
-
-            if is_impulse_turnover:
-                # Immediate turnover without waiting 22 frames
-                current_possessor = opponent_team
-                possession_established = True
-                opp_control_streak = 0
-                control_streak = 10
-                labels[t] = LABEL_H if current_possessor == HOME_CODE else LABEL_A
-                possessor_history[t] = current_possessor
-                continue
-
-            # 6. Sustained controlled opponent possession check (Hysteresis)
-            opponent_has_control = (
-                (d_opponent <= control_radius)
-                and (d_opponent < d_possessor)
-            )
-
-            if opponent_has_control:
-                opp_control_streak += 1
-                if opp_control_streak >= min_control_frames:
-                    # Turnover confirmed via hysteresis
+            # 5. Pass-Preserving Possession Evidence (opp_evidence)
+            # Reset only when possessing team re-establishes clear proximity
+            if d_possessor <= 1.8 and d_possessor < d_opponent:
+                opp_evidence = 0
+            # Continue accumulating when opponent receives / controls
+            elif d_opponent <= 2.0 and d_opponent < d_possessor:
+                opp_evidence += 1
+                if opp_evidence >= min_control_frames:
+                    # Turnover confirmed via sustained evidence
                     current_possessor = opponent_team
                     possession_established = True
-                    opp_control_streak = 0
+                    opp_evidence = 0
                     control_streak = min_control_frames
-            else:
-                if d_opponent > control_radius + 0.6:
-                    opp_control_streak = 0
-                else:
-                    opp_control_streak = max(0, opp_control_streak - 1)
+            elif d_home > 2.2 and d_away > 2.2:
+                # Free flight: freeze opp_evidence
+                pass
+            # Otherwise (neither clear possessor proximity nor opponent receiving nor free flight):
+            # opp_evidence remains frozen
 
             # Confirm established possession if possessor stays near ball
             if d_possessor <= control_radius:
@@ -385,6 +458,14 @@ def run_possession_state_machine(
 
             labels[t] = LABEL_H if current_possessor == HOME_CODE else LABEL_A
             possessor_history[t] = current_possessor
+
+    # 6. Minimum live spell regularization (absorb micro-flips < min_live_spell_frames)
+    regularize_live_spells(
+        labels=labels,
+        half_blocks=half_blocks,
+        min_live_spell_frames=min_live_spell_frames,
+        possessor_history=possessor_history,
+    )
 
     # Enforce strictly valid labels
     invalid_mask = ~np.isin(labels, list(VALID_LABELS))

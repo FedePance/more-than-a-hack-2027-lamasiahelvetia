@@ -198,16 +198,16 @@ def load_raw_tracking_data(
             outfield_indices = np.flatnonzero(is_outfield_slot)
 
     # Compute collective outfield player speed statistics (mean and 80th percentile)
-    outfield_speeds = player_speed[:, outfield_indices]
-    mean_player_speed = np.zeros(n_expected_frames, dtype=np.float32)
-    p80_player_speed = np.zeros(n_expected_frames, dtype=np.float32)
-
-    for i in range(n_expected_frames):
-        row = outfield_speeds[i]
-        valid_speeds = row[~np.isnan(row)]
-        if len(valid_speeds) > 0:
-            mean_player_speed[i] = float(np.mean(valid_speeds))
-            p80_player_speed[i] = float(np.percentile(valid_speeds, 80))
+    if len(outfield_indices) > 0:
+        outfield_speeds = player_speed[:, outfield_indices]
+        with np.errstate(invalid="ignore"):
+            mean_player_speed = np.nanmean(outfield_speeds, axis=1)
+            p80_player_speed = np.nanpercentile(outfield_speeds, 80, axis=1)
+        mean_player_speed = np.nan_to_num(mean_player_speed, nan=0.0).astype(np.float32)
+        p80_player_speed = np.nan_to_num(p80_player_speed, nan=0.0).astype(np.float32)
+    else:
+        mean_player_speed = np.zeros(n_expected_frames, dtype=np.float32)
+        p80_player_speed = np.zeros(n_expected_frames, dtype=np.float32)
 
     return RawTrackingData(
         n_frames=n_expected_frames,

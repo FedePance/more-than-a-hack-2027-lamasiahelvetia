@@ -2,9 +2,10 @@
 
 Handles the ~41% missing ball observations in Metrica ATD by:
 1. Bidirectional kinematic reachability filtering to eliminate 1-3 frame false-positive teleportation spikes.
-2. Monotonic shape-preserving interpolation (PchipInterpolator) for short occlusions (< 35 frames).
-3. Savitzky-Golay trajectory smoothing and exact analytic PCHIP derivatives for jitter-free ball velocities.
-4. Marking prolonged blackouts (>= 35 frames) as uncertain for downstream abstention ('X').
+2. Savitzky-Golay trajectory smoothing on contiguous raw observed segments before interpolation.
+3. Central-difference velocity estimation on smoothed raw segments.
+4. Monotonic shape-preserving interpolation (PchipInterpolator) with exact analytic derivatives across short occlusions (< 35 frames).
+5. Marking prolonged blackouts (>= 35 frames) as uncertain for downstream abstention ('X').
 """
 
 from dataclasses import dataclass
@@ -147,13 +148,15 @@ def reconstruct_ball_trajectory(
     """Reconstruct missing ball positions across short occlusions and flag blackouts.
 
     Rules:
-    - Missing gaps < max_gap_frames (1.4 s at 25 fps) with physically feasible endpoint
-      velocities are smoothly interpolated.
-    - Long blackouts (>= max_gap_frames) or gaps with physically impossible implied speeds
-      (> 38 m/s) are NOT hallucinated; they are flagged as uncertain for downstream abstention ('X').
-    - Continuous valid ball position segments are smoothed with a Savitzky-Golay filter to eliminate
-      quantization jitter before velocity estimation.
-    - Inside PCHIP interpolated gaps, ball velocity is computed using exact analytic derivatives.
+    - Continuous raw valid ball position segments are smoothed with a Savitzky-Golay filter
+      before interpolation to eliminate quantization jitter.
+    - Central-difference velocities are computed on the smoothed raw segments.
+    - Missing gaps < max_gap_frames (1.4 s at 25 fps) with physically feasible endpoint velocities
+      are smoothly interpolated using monotonic shape-preserving PchipInterpolator.
+    - Inside interpolated gaps, ball velocities are computed using exact analytic PCHIP derivatives,
+      ensuring 100% kinematic consistency across gap boundaries.
+    - Long blackouts (>= max_gap_frames) or gaps with physically impossible implied speeds (> 38 m/s)
+      are NOT hallucinated; they are flagged as uncertain for downstream abstention ('X').
 
     Args:
         raw_ball_xy: Raw ball (x, y) coordinates in metres, shape (n_frames, 2).
@@ -183,10 +186,49 @@ def reconstruct_ball_trajectory(
     is_ball_uncertain = raw_missing.copy()
     ball_speed = np.full(n_frames, np.nan, dtype=np.float32)
 
-    # Find all contiguous missing spans
-    spans = find_missing_spans(raw_missing)
+    # 1. Identify contiguous raw observed segments, apply Savitzky-Golay smoothing,
+    # and compute central-difference velocities BEFORE interpolating missing gaps
+    missing_spans = find_missing_spans(raw_missing)
+    raw_observed_blocks = []
+    prev_end = 0
+    for s, e in missing_spans:
+        if s > prev_end:
+            raw_observed_blocks.append((prev_end, s))
+        prev_end = e
+    if prev_end < n_frames:
+        raw_observed_blocks.append((prev_end, n_frames))
 
-    for start_idx, end_idx in spans:
+    for s, e in raw_observed_blocks:
+        block_len = e - s
+        if block_len >= savgol_window:
+            reconstructed_xy[s:e, 0] = savgol_filter(
+                reconstructed_xy[s:e, 0], window_length=savgol_window, polyorder=savgol_polyorder
+            )
+            reconstructed_xy[s:e, 1] = savgol_filter(
+                reconstructed_xy[s:e, 1], window_length=savgol_window, polyorder=savgol_polyorder
+            )
+
+        # Compute central-difference velocities on the smoothed raw segments
+        for i in range(s, e):
+            has_prev = (i > s)
+            has_next = (i < e - 1)
+            if has_prev and has_next:
+                vx = (reconstructed_xy[i + 1, 0] - reconstructed_xy[i - 1, 0]) / (2.0 * dt)
+                vy = (reconstructed_xy[i + 1, 1] - reconstructed_xy[i - 1, 1]) / (2.0 * dt)
+                ball_speed[i] = np.sqrt(vx * vx + vy * vy)
+            elif has_next:
+                vx = (reconstructed_xy[i + 1, 0] - reconstructed_xy[i, 0]) / dt
+                vy = (reconstructed_xy[i + 1, 1] - reconstructed_xy[i, 1]) / dt
+                ball_speed[i] = np.sqrt(vx * vx + vy * vy)
+            elif has_prev:
+                vx = (reconstructed_xy[i, 0] - reconstructed_xy[i - 1, 0]) / dt
+                vy = (reconstructed_xy[i, 1] - reconstructed_xy[i - 1, 1]) / dt
+                ball_speed[i] = np.sqrt(vx * vx + vy * vy)
+            else:
+                ball_speed[i] = 0.0
+
+    # 2. Interpolate missing gaps using PchipInterpolator and exact analytic derivatives
+    for start_idx, end_idx in missing_spans:
         gap_len = end_idx - start_idx
 
         # Boundary gaps at beginning or end of recording cannot be safely interpolated
@@ -210,93 +252,37 @@ def reconstruct_ball_trajectory(
         if gap_len < max_gap_frames and avg_speed <= max_physical_speed_mps:
             gap_frame_indices = np.arange(start_idx, end_idx)
 
-            if gap_len <= 4:
-                # Linear interpolation
-                alphas = (np.arange(1, gap_len + 1) / (gap_len + 1)).reshape(-1, 1)
-                interp_points = p_prev + alphas * (p_next - p_prev)
-                reconstructed_xy[start_idx:end_idx] = interp_points
-                is_ball_uncertain[start_idx:end_idx] = False
+            left_ctx = max(0, start_idx - 10)
+            right_ctx = min(n_frames, end_idx + 10)
 
-                # Analytic constant speed for linear segment
-                vx_linear = dx / time_gap
-                vy_linear = dy / time_gap
-                ball_speed[start_idx:end_idx] = float(np.sqrt(vx_linear * vx_linear + vy_linear * vy_linear))
+            valid_left = [i for i in range(left_ctx, start_idx) if not np.isnan(reconstructed_xy[i, 0])]
+            valid_right = [i for i in range(end_idx, right_ctx) if not np.isnan(reconstructed_xy[i, 0])]
+
+            if len(valid_left) >= 2 and len(valid_right) >= 2:
+                ctx_indices = np.array(valid_left[-3:] + valid_right[:3])
+                ctx_x = reconstructed_xy[ctx_indices, 0]
+                ctx_y = reconstructed_xy[ctx_indices, 1]
+
+                pchip_x = PchipInterpolator(ctx_indices, ctx_x)
+                pchip_y = PchipInterpolator(ctx_indices, ctx_y)
+
+                reconstructed_xy[start_idx:end_idx, 0] = pchip_x(gap_frame_indices)
+                reconstructed_xy[start_idx:end_idx, 1] = pchip_y(gap_frame_indices)
+
+                # Analytic velocity derivatives (d/d_frame * fps = d/d_second)
+                vx_analytic = pchip_x.derivative(1)(gap_frame_indices) * fps
+                vy_analytic = pchip_y.derivative(1)(gap_frame_indices) * fps
+                ball_speed[start_idx:end_idx] = np.sqrt(vx_analytic * vx_analytic + vy_analytic * vy_analytic)
             else:
-                # Shape-preserving PCHIP with analytic derivatives
-                left_ctx = max(0, start_idx - 10)
-                right_ctx = min(n_frames, end_idx + 10)
+                alphas = (np.arange(1, gap_len + 1) / (gap_len + 1)).reshape(-1, 1)
+                reconstructed_xy[start_idx:end_idx] = p_prev + alphas * (p_next - p_prev)
+                vx_lin = dx / time_gap
+                vy_lin = dy / time_gap
+                ball_speed[start_idx:end_idx] = float(np.sqrt(vx_lin * vx_lin + vy_lin * vy_lin))
 
-                valid_left = [i for i in range(left_ctx, start_idx) if not np.isnan(reconstructed_xy[i, 0])]
-                valid_right = [i for i in range(end_idx, right_ctx) if not np.isnan(reconstructed_xy[i, 0])]
-
-                if len(valid_left) >= 2 and len(valid_right) >= 2:
-                    ctx_indices = np.array(valid_left[-3:] + valid_right[:3])
-                    ctx_x = reconstructed_xy[ctx_indices, 0]
-                    ctx_y = reconstructed_xy[ctx_indices, 1]
-
-                    pchip_x = PchipInterpolator(ctx_indices, ctx_x)
-                    pchip_y = PchipInterpolator(ctx_indices, ctx_y)
-
-                    reconstructed_xy[start_idx:end_idx, 0] = pchip_x(gap_frame_indices)
-                    reconstructed_xy[start_idx:end_idx, 1] = pchip_y(gap_frame_indices)
-
-                    # Analytic velocity derivatives (d/d_frame * fps = d/d_second)
-                    vx_analytic = pchip_x.derivative(1)(gap_frame_indices) * fps
-                    vy_analytic = pchip_y.derivative(1)(gap_frame_indices) * fps
-                    ball_speed[start_idx:end_idx] = np.sqrt(vx_analytic * vx_analytic + vy_analytic * vy_analytic)
-                else:
-                    alphas = (np.arange(1, gap_len + 1) / (gap_len + 1)).reshape(-1, 1)
-                    reconstructed_xy[start_idx:end_idx] = p_prev + alphas * (p_next - p_prev)
-                    vx_lin = dx / time_gap
-                    vy_lin = dy / time_gap
-                    ball_speed[start_idx:end_idx] = float(np.sqrt(vx_lin * vx_lin + vy_lin * vy_lin))
-
-                is_ball_uncertain[start_idx:end_idx] = False
+            is_ball_uncertain[start_idx:end_idx] = False
         else:
             is_ball_uncertain[start_idx:end_idx] = True
-
-    # Smooth continuous valid segments using Savitzky-Golay filter
-    valid_spans = find_missing_spans(is_ball_uncertain)
-    # The valid spans are the complements of missing spans
-    valid_blocks = []
-    prev_end = 0
-    for s, e in valid_spans:
-        if s > prev_end:
-            valid_blocks.append((prev_end, s))
-        prev_end = e
-    if prev_end < n_frames:
-        valid_blocks.append((prev_end, n_frames))
-
-    for vs, ve in valid_blocks:
-        block_len = ve - vs
-        if block_len >= savgol_window:
-            # Apply light Savitzky-Golay filter along time axis
-            reconstructed_xy[vs:ve, 0] = savgol_filter(
-                reconstructed_xy[vs:ve, 0], window_length=savgol_window, polyorder=savgol_polyorder
-            )
-            reconstructed_xy[vs:ve, 1] = savgol_filter(
-                reconstructed_xy[vs:ve, 1], window_length=savgol_window, polyorder=savgol_polyorder
-            )
-
-        # Compute central-difference velocity for frames in this block that don't have analytic speed
-        for i in range(vs, ve):
-            if np.isnan(ball_speed[i]):
-                has_prev = (i > vs)
-                has_next = (i < ve - 1)
-                if has_prev and has_next:
-                    vx = (reconstructed_xy[i + 1, 0] - reconstructed_xy[i - 1, 0]) / (2.0 * dt)
-                    vy = (reconstructed_xy[i + 1, 1] - reconstructed_xy[i - 1, 1]) / (2.0 * dt)
-                    ball_speed[i] = np.sqrt(vx * vx + vy * vy)
-                elif has_next:
-                    vx = (reconstructed_xy[i + 1, 0] - reconstructed_xy[i, 0]) / dt
-                    vy = (reconstructed_xy[i + 1, 1] - reconstructed_xy[i, 1]) / dt
-                    ball_speed[i] = np.sqrt(vx * vx + vy * vy)
-                elif has_prev:
-                    vx = (reconstructed_xy[i, 0] - reconstructed_xy[i - 1, 0]) / dt
-                    vy = (reconstructed_xy[i, 1] - reconstructed_xy[i - 1, 1]) / dt
-                    ball_speed[i] = np.sqrt(vx * vx + vy * vy)
-                else:
-                    ball_speed[i] = 0.0
 
     return BallTrackingResult(
         ball_xy=reconstructed_xy.astype(np.float32),

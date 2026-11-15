@@ -8,8 +8,8 @@ Executes end-to-end:
 1. Asset resolution via games.py and MTAH_DATA_DIR (fallback to ./data)
 2. Streaming raw tracking and Smart Tagging loading
 3. Ball trajectory reconstruction with Savitzky-Golay and analytic derivatives (src/ball_tracking.py)
-4. Dead ball detection combining Smart Tagging and outfield player kinematics (src/dead_ball.py)
-5. Temporal hysteresis possession state machine with impulse turnover detection (src/possession_engine.py)
+4. Dead ball detection combining Smart Tagging, out-of-bounds latching, and p80 kinematics (src/dead_ball.py)
+5. Temporal hysteresis possession state machine with pass-preserving evidence and spell regularization (src/possession_engine.py)
 6. Submission export and verification against official format rules
 """
 
@@ -245,12 +245,14 @@ def run_pipeline(
         min_stoppage_duration_frames=config.min_stoppage_duration_frames,
         stationary_ball_speed_mps=config.stationary_ball_speed_mps,
         abandoned_ball_distance_m=config.abandoned_ball_distance_m,
+        standalone_stoppage_frames=config.standalone_stoppage_frames,
+        standalone_p80_threshold_mps=config.standalone_p80_threshold_mps,
         fps=fps,
     )
     dead_count = int(np.sum(dead_ball_result.is_dead_ball))
     print(f"      Dead Ball detected on {dead_count}/{n_frames} frames ({100.0 * dead_count / n_frames:.1f}%).")
 
-    print("\n[5/5] Running temporal hysteresis possession state machine (impulse + selective X)...")
+    print("\n[5/5] Running temporal hysteresis possession state machine (pass-preserving + selective X)...")
     possession_result = run_possession_state_machine(
         n_frames=n_frames,
         ball_xy=ball_result.ball_xy,
@@ -266,9 +268,8 @@ def run_pipeline(
         control_radius=config.control_radius,
         min_control_frames=config.min_control_frames,
         scramble_abstain_frames=config.scramble_abstain_frames,
-        impulse_speed_threshold_mps=config.impulse_speed_threshold_mps,
-        impulse_proximity_m=config.impulse_proximity_m,
         restart_search_frames=config.restart_search_frames,
+        min_live_spell_frames=config.min_live_spell_frames,
         fps=fps,
     )
 
