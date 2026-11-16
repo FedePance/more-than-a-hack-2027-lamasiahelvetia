@@ -72,7 +72,7 @@ To achieve high spell continuity under real-world tracking constraints (notably 
 ### Assets Used
 - **Automatic Tracking Data (ATD) Tactical (`BAR-ATH_tactical_atd.txt`):** The primary quantitative signal, providing 2D metric coordinates on a $105.3\text{ m} \times 68.0\text{ m}$ pitch for all 22 player slots and the ball across all 199,319 video frames at 25 fps.
 - **Smart Tagging XML (`BAR-ATH_tactical_smart_tagging.xml`):** Provides coarse tactical phase intervals, set-piece types (kickoff, throw-in, corner kick, free kick, goal kick, penalty), stoppage timestamps, and associated team attribution strings.
-- **EPTS Metadata XML (`BAR-ATH_tactical_atd.xml`):** Used to extract official club identities (`idLocalTeam` = FC Barcelona, `idVisitingTeam` = Athletic Club) and isolate goalkeeper tracking slots (`position_index == 0`) from outfield tactical kinematics.
+- **EPTS Metadata XML (`BAR-ATH_tactical_atd.xml`):** Used to extract official club identities (`idLocalTeam` = FC Barcelona, `idVisitingTeam` = Athletic Club) and isolate goalkeeper tracking slots (`position_index == 0`) from outfield tactical kinematics. A tracking slot whose team id matches neither club is left unassigned and never counts toward either team's distance to the ball.
 
 ### Assets Dropped & Why
 - **Broadcast & Tactical Video (`.mp4`):** *Dropped.* Computer vision models (e.g., YOLO or video action transformers) require significant GPU resources and introduce spatial calibration errors under dynamic broadcast zooming. Relying strictly on metric pitch coordinates guarantees zero video decoding overhead and pure domain invariance.
@@ -110,6 +110,7 @@ To bridge the gap between clean open-data tracking and the noisy competition env
 1. **Kinematic Spike Filtering:** Optical tracking occasionally introduces 1–3 frame teleportation spikes where the ball jumps to a stray artifact. A bidirectional reachability check removes intermediate detections requiring speeds $> 40.0\text{ m/s}$ (~144 km/h) if the bounding anchors are mutually reachable.
 2. **Savitzky-Golay Smoothing:** Contiguous valid observation segments are smoothed (`window=7`, `polyorder=2`) to eliminate sensor jitter prior to velocity estimation.
 3. **Monotonic PCHIP Interpolation:** Gaps $< 35$ frames ($1.4\text{ s}$) with average speed $\le 38.0\text{ m/s}$ are reconstructed using monotonic cubic Hermite polynomials (`PchipInterpolator`), with instantaneous velocities computed via exact analytic derivatives. Gaps $\ge 35$ frames are flagged as unobserved blackouts (`is_ball_uncertain = True`).
+4. **Input Sanitization:** A detection is used only when both coordinates are finite; malformed records and infinite values are treated as missing. On observed segments, ball speed is a central difference (one-sided at segment edges) evaluated with float64 intermediates, so the result does not depend on the NumPy version's type-promotion rules.
 
 #### Physical Dead-Ball Detection (`src/dead_ball.py`)
 1. **Playing Period Masking:** Halftime (20,156 frames), pre-match, and post-match spans are locked to Dead Ball ($D$) based on official half boundaries.
@@ -153,9 +154,20 @@ Every frame is projected into a standardized feature vector:
 2. **Symmetric Non-Causal 1D-TCN (`PossessionTCN1D`):** Multi-scale 1D dilated temporal convolutional network using dilation cycles $(1, 2, 4, 8, 16)$ with GroupNorm and GELU activations. Its symmetric bidirectional receptive field (~250 frames / 10.0 s) localizes possession transitions with zero temporal phase lag.
 
 #### Hybrid Kinematic Fusion & Viterbi Sequence Decoding
-- **Kinematic Dead-Ball Boosting (`--hybrid-dead-ball`):** Multi-model ensemble probabilities are converted to log-odds. For frames confirmed as Dead Ball by physical and speed heuristics, Dead Ball emission log-probabilities receive an additive boost of $+1.5$, locking confirmed stoppages.
-- **Numba-Accelerated Viterbi Decoder (`src/ml_pipeline/viterbi.py`):** Solves the global optimal state path across each half independently in $< 5\text{ ms}$ using JIT-compiled dynamic programming. Transition penalties suppress spurious micro-flips ($H \leftrightarrow A$ penalty $= 3.0$, Live $\leftrightarrow D$ penalty $= 2.0$).
-- **Selective Abstention (`X`):** Applied conditionally post-Viterbi when the ball is unobserved and model confidence is below $0.45$.
+- **Kinematic Dead-Ball Boosting (`--hybrid-dead-ball`):** Multi-model ensemble probabilities are floored at $10^{-7}$ and converted to log-scores, so every emission is finite. On frames flagged as Dead Ball by the physical detector, the Dead Ball log-score receives an additive boost $b$ (default $+1.5$); on all other frames inside the half it is lowered by $b/2$ (default $-0.75$). The fused scores are re-normalized with a log-softmax before decoding.
+- **Numba-Accelerated Viterbi Decoder (`src/ml_pipeline/viterbi.py`):** Solves the global optimal state path across each half independently in $< 5\text{ ms}$ using JIT-compiled dynamic programming. Transition penalties suppress spurious micro-flips ($H \leftrightarrow A$ penalty $= 3.0$, Live $\leftrightarrow D$ penalty $= 2.0$). Path scores are accumulated in float64 with strict IEEE arithmetic: with float32, the running score over a ~80,000-frame half loses resolution and near-ties are settled by rounding noise. Ties resolve toward the lowest state index, so the Numba kernel and the NumPy fallback return the same path.
+- **Selective Abstention (`X`):** Applied conditionally post-Viterbi when the ball is unobserved and model confidence is below $0.45$. The visibility used here is feature 3 of the model input, so abstention is always consistent with what the models were shown.
+
+---
+
+### 3.4 Robustness, Determinism & Halftime Isolation
+
+- **Label Guarantee:** State codes are range-checked before conversion to labels, and both CLIs run the submission contract check before writing the CSV. A blank or out-of-alphabet label raises an error instead of reaching the file.
+- **Halftime Isolation:** Half 1 covers video frames `11185..90651` and half 2 covers `110808..190197`. Sliding windows, LightGBM temporal features, Viterbi state, the out-of-bounds latch, and the possession state machine are evaluated per half and never cross the break. All frames outside the two halves, including halftime `90652..110807`, are written as $D$.
+- **Non-Finite Safety:** The feature matrix is guaranteed finite before it reaches a model. In the decoder, NaN emission rows become uniform and infinite logits are clamped.
+- **Short Sequences:** A sequence shorter than the sliding window is covered by a single window spanning all of it, and a stride larger than the window is rejected, so no frame is left without a prediction.
+- **Seeding:** Training, ensemble tuning, and inference seed Python, NumPy, and PyTorch and request deterministic cuDNN kernels.
+- **Checkpoint Compatibility:** The 14-feature order and the layer definitions of `PossessionBiGRU` and `PossessionTCN1D` are frozen, so trained checkpoints remain loadable without retraining.
 
 ---
 
@@ -180,8 +192,8 @@ Every frame is projected into a standardized feature vector:
 
 ### 5.1 Environment Setup
 ```bash
-# Clone repository and enter environment
-cd /workspaces/barca-hackathon
+# Clone repository and enter its root directory
+cd more-than-a-hack-2027-lamasiahelvetia
 
 # Install pinned dependencies (PyTorch CPU, Numba, LightGBM, Kloppy)
 pip install -r requirements.txt
@@ -210,10 +222,28 @@ python src/run_pipeline.py \
   --output results/lamasia_helvetia_physics.csv
 ```
 
-### 5.3 Submission Validation
+### 5.3 Submission Validation & Scoring
 Verify compliance against the official competition submission contract:
 ```bash
 python evaluation/validate_submission.py results/lamasia_helvetia_bigru.csv
+```
+
+Score every CSV in `results/` against the public 5-minute ground truth with the official scorer (`--results results` points it at the repository-root output folder instead of its default `evaluation/results/`):
+```bash
+python evaluation/run_evaluation.py --results results
+```
+
+### 5.4 Retraining & Ensemble Weight Tuning (Optional)
+The shipped checkpoints do not need retraining. To reproduce them from the open data:
+```bash
+# Fold checkpoints (repeat with --arch tcn_1d)
+python src/ml_pipeline/train_logo.py --mode logo --arch bi_gru --output-dir models
+
+# Full checkpoints (repeat with --arch tcn_1d)
+python src/ml_pipeline/train_logo.py --mode full --arch bi_gru --output-dir models
+
+# Choose BiGRU / TCN-1D blending weights on the held-out open games
+python src/ml_pipeline/tune_ensemble_logo.py --models-dir models
 ```
 
 ---

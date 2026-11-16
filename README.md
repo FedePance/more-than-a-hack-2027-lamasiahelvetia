@@ -24,7 +24,7 @@ The system strictly enforces zero-leakage competition data isolation:
 ## 2. Repository Structure
 
 ```
-barca-hackathon/
+more-than-a-hack-2027-lamasiahelvetia/
 ├── .devcontainer/                  # Dev Container & Docker environment configuration
 │   ├── Dockerfile                  # Container environment with PyTorch and dependencies
 │   ├── devcontainer.json           # VS Code configuration with bind-mount points
@@ -49,6 +49,7 @@ barca-hackathon/
 │   ├── config.py                   # Centralized PipelineConfig dataclass with physical parameters
 │   ├── data_loader.py              # Streaming raw ATD tracking and metadata parser
 │   ├── dead_ball.py                # Smart Tagging dilation, boundary latching, and p80 kinematics
+│   ├── mask_utils.py               # Shared run-length helpers for boolean frame masks
 │   ├── possession_engine.py        # Hysteresis state machine, pass preservation, and spell regularizer
 │   ├── run_pipeline.py             # CLI entrypoint for the deterministic physics pipeline
 │   └── ml_pipeline/                # Supervised sequence and tabular learning framework
@@ -56,8 +57,10 @@ barca-hackathon/
 │       ├── dataset_open.py         # Open data loader, GT derivation, and on-the-fly augmentations
 │       ├── features.py             # Canonical 14-dimensional domain-invariant feature extractor
 │       ├── infer_match.py          # Match inference CLI (ensembles, hybrid dead-ball, Viterbi)
+│       ├── inference.py            # Shared seeding, device, checkpoint loading, sliding-window prediction
 │       ├── train_logo.py           # Leave-One-Game-Out CV & full training CLI
-│       ├── viterbi.py              # Numba-accelerated 3-state Viterbi decoder with selective X
+│       ├── tune_ensemble_logo.py   # LOGO tuning of BiGRU / TCN-1D ensemble blending weights
+│       ├── viterbi.py              # Numba-accelerated 3-state Viterbi decoder (float64) with selective X
 │       └── models/                 # Model architectures registry
 │           ├── __init__.py         # Model factory (build_model)
 │           ├── bi_gru.py           # Bidirectional GRU with residual MLP classification head
@@ -157,6 +160,8 @@ python src/run_pipeline.py \
 - **Dead-Ball Identification (`src/dead_ball.py`):** Fuses Smart Tagging event intervals, pitch boundary out-of-bounds latching, and collective 80th-percentile player speed drops.
 - **Possession State Machine (`src/possession_engine.py`):** Enforces pass-preserving evidence accumulation, resolves kickoffs dynamically, abstains (`X`) on contested scrambles, and regularizes micro-flips (< 35 frames).
 
+`--source` accepts only `tactical`: submissions are indexed to the tactical video, and the half boundaries and Smart Tagging exist only on that timeline.
+
 ---
 
 ### 4.2 Machine Learning Model Training (LOGO CV & Full Training)
@@ -217,6 +222,13 @@ python src/ml_pipeline/train_logo.py \
 
 Checkpoints are saved to `models/{arch}_fold_{1,2,3}.pt` and `models/{arch}_full.pt` (or `.joblib` for LightGBM).
 
+#### Tuning Ensemble Blending Weights (BiGRU + TCN-1D):
+Once the fold checkpoints of both architectures exist, the blending weights are chosen on the held-out open games only (never on the competition match):
+```bash
+python src/ml_pipeline/tune_ensemble_logo.py --models-dir models
+```
+The script scores a fixed grid of weight pairs with the official metrics under the 41% synthetic ball blackout and prints a ready-to-run `infer_match.py` command for the best pair. It stops immediately, before loading any data, if a fold checkpoint is missing.
+
 ---
 
 ### 4.3 Running Match Inference (`src/ml_pipeline/infer_match.py`)
@@ -264,9 +276,16 @@ python src/ml_pipeline/infer_match.py \
 - `--abstain-threshold`: Probability confidence threshold below which occluded ball frames emit `X` (default: `0.45`).
 - `--no-abstain`: Disables selective abstention, emitting strictly `{H, A, D}`.
 
+**Argument Rules (checked before any data is loaded):**
+- `--checkpoints` and `--ensemble` are mutually exclusive.
+- `--weights` requires `--checkpoints`, must have one finite non-negative value per checkpoint, and must sum to a positive value. Weights are normalized to sum to 1.
+- `--stride` must satisfy `1 <= stride <= seq-len`, so every frame is covered by at least one window.
+- Transition penalties and `--dead-ball-boost` must be finite and non-negative; `--abstain-threshold` must lie in `[0, 1]`.
+- Missing checkpoint files are reported up front, all at once.
+
 ---
 
-### 4.4 Validating Output Submissions
+### 4.4 Validating and Scoring Output Submissions
 Before submitting or evaluating any generated CSV, verify that it complies strictly with the competition submission contract:
 
 ```bash
@@ -280,3 +299,22 @@ The script verifies:
 4. Absence of empty cells or `NaN` values.
 5. Strict membership of labels in the valid alphabet: `{'H', 'A', 'D', 'X'}`.
 6. Analyzes possession statistics (total spells, mean spell duration, and class balance).
+
+To score every CSV in `results/` against the public 5-minute ground truth with the official scorer:
+
+```bash
+python evaluation/run_evaluation.py --results results
+```
+
+`--results results` is required because the scorer looks in `evaluation/results/` by default, while the pipelines in this repository write to `results/` at the repository root.
+
+---
+
+## 5. Robustness & Reproducibility Guarantees
+
+- **Valid labels only:** Decoded state codes are checked before conversion to labels; a code outside `{H, A, D, X}` raises an error instead of being written. Both CLIs also run the submission contract check before saving the CSV.
+- **Halftime isolation:** Each half is processed independently. Sliding windows, LightGBM temporal features, Viterbi state, the out-of-bounds latch, and the possession state machine never cross the halftime break. Every frame outside the two halves (pre-match, halftime `90652..110807`, post-match) is written as `D`.
+- **Non-finite inputs:** Malformed tracking records are skipped, infinite coordinates are treated as missing, the feature matrix is guaranteed finite, and the Viterbi decoder replaces NaN emission rows with a uniform distribution.
+- **Deterministic decoding:** Viterbi path scores are accumulated in float64 with strict IEEE arithmetic, and ties resolve toward the lowest state index, so the Numba kernel and the NumPy fallback return the same path.
+- **Seeding:** Training, ensemble tuning, and inference seed Python, NumPy, and PyTorch and request deterministic cuDNN kernels.
+- **Checkpoint compatibility:** The 14-feature order and the `PossessionBiGRU` / `PossessionTCN1D` layer definitions are frozen; existing `.pt` checkpoints load without retraining.
