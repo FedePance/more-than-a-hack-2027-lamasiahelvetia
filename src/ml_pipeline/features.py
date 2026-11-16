@@ -20,11 +20,12 @@ Features (14 dimensions):
     13. is_stoppage_tag: 1.0 during stoppage / set-piece setup intervals, 0.0 otherwise.
 """
 
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
 
-# Canonical feature specifications
+# Canonical feature specifications (order and semantics are frozen: trained checkpoints depend on them)
 FEATURE_NAMES = [
     "min_dist_home",
     "min_dist_away",
@@ -43,6 +44,65 @@ FEATURE_NAMES = [
 ]
 N_FEATURES = len(FEATURE_NAMES)
 MISSING_DIST_SENTINEL = 50.0
+BALL_VISIBLE_INDEX = FEATURE_NAMES.index("is_ball_visible")
+
+
+def mask_ball_features(features: np.ndarray, masked: np.ndarray) -> np.ndarray:
+    """Reset every ball-dependent channel (features 0-8) on frames where the ball is unobserved.
+
+    Distances fall back to MISSING_DIST_SENTINEL; visibility, ball speed, ball position and
+    closest-player speeds fall back to 0.0. This is the single definition of what a
+    "ball missing" frame looks like, shared by feature extraction, augmentation and validation.
+
+    Args:
+        features: Feature matrix of shape (n_frames, 14), modified in place.
+        masked: Boolean mask of shape (n_frames,), True where the ball is missing / occluded.
+
+    Returns:
+        The same features array, for chaining.
+    """
+    features[masked, 0:2] = MISSING_DIST_SENTINEL  # min_dist_home, min_dist_away
+    features[masked, 2:9] = 0.0                    # dist_diff .. closest_away_speed
+    return features
+
+
+def _closest_player_stats(
+    player_xy: np.ndarray,
+    player_speed: np.ndarray,
+    ball_xy: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Distance to, and speed of, the player closest to the ball on each frame.
+
+    Args:
+        player_xy: Positions of one team's outfield players, shape (n, n_players, 2).
+        player_speed: Their speeds, shape (n, n_players).
+        ball_xy: Ball positions, shape (n, 2).
+
+    Returns:
+        Tuple (min_dist, closest_speed), each of shape (n,). Frames with no observed player
+        get MISSING_DIST_SENTINEL and speed 0.0.
+    """
+    n_rows, n_players = player_xy.shape[:2]
+    if n_players == 0:
+        return (
+            np.full(n_rows, MISSING_DIST_SENTINEL, dtype=np.float32),
+            np.zeros(n_rows, dtype=np.float32),
+        )
+
+    dx = player_xy[:, :, 0] - ball_xy[:, 0:1]
+    dy = player_xy[:, :, 1] - ball_xy[:, 1:2]
+    dist = np.sqrt(dx * dx + dy * dy)
+    dist[np.isnan(dist)] = np.inf
+
+    rows = np.arange(n_rows)
+    min_idx = np.argmin(dist, axis=1)
+    min_dist = dist[rows, min_idx]
+    no_player = np.isinf(min_dist)
+    min_dist[no_player] = MISSING_DIST_SENTINEL
+
+    closest_speed = player_speed[rows, min_idx]
+    closest_speed[no_player | np.isnan(closest_speed)] = 0.0
+    return min_dist, closest_speed
 
 
 @dataclass
@@ -97,9 +157,24 @@ def extract_frame_features(
         away_centroid_x_norm: Optional precomputed Away outfield normalized x centroid, shape (n_frames,).
 
     Returns:
-        np.ndarray of shape (n_frames, 14), dtype float32.
+        np.ndarray of shape (n_frames, 14), dtype float32, guaranteed finite.
+
+    Raises:
+        ValueError: If a per-frame input does not have the same number of rows as is_ball_visible.
     """
     n_frames = len(is_ball_visible)
+    for name, values in (
+        ("ball_xy", ball_xy),
+        ("ball_speed", ball_speed),
+        ("home_player_xy", home_player_xy),
+        ("home_player_speed", home_player_speed),
+        ("away_player_xy", away_player_xy),
+        ("away_player_speed", away_player_speed),
+        ("is_stoppage_tag", is_stoppage_tag),
+    ):
+        if len(values) != n_frames:
+            raise ValueError(f"{name} has {len(values)} rows, expected {n_frames}")
+
     features = np.zeros((n_frames, N_FEATURES), dtype=np.float32)
 
     length, width = pitch
@@ -109,6 +184,13 @@ def extract_frame_features(
     # Ensure boolean visibility mask
     visible_mask = np.asarray(is_ball_visible, dtype=bool) & ~np.isnan(ball_xy[:, 0])
 
+    def centroid_x_norm(player_xy: np.ndarray) -> np.ndarray:
+        with np.errstate(invalid="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)  # frames with no tracked player
+            mean_x = np.nanmean(player_xy[:, :, 0], axis=1)
+        norm_x = (mean_x - half_length) / half_length
+        return np.clip(np.nan_to_num(norm_x, nan=0.0), -1.0, 1.0).astype(np.float32)
+
     # 1. Collective outfield player speed statistics (features 9 and 10)
     if outfield_mean_speed is not None and outfield_p80_speed is not None:
         features[:, 9] = np.nan_to_num(outfield_mean_speed, nan=0.0).astype(np.float32)
@@ -116,7 +198,8 @@ def extract_frame_features(
     else:
         # Concatenate Home and Away outfield speeds
         combined_speeds = np.concatenate([home_player_speed, away_player_speed], axis=1)
-        with np.errstate(invalid="ignore"):
+        with np.errstate(invalid="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)  # frames with no tracked player
             mean_speed = np.nanmean(combined_speeds, axis=1)
             p80_speed = np.nanpercentile(combined_speeds, 80, axis=1)
         features[:, 9] = np.nan_to_num(mean_speed, nan=0.0).astype(np.float32)
@@ -126,34 +209,21 @@ def extract_frame_features(
     if home_centroid_x_norm is not None:
         features[:, 11] = np.nan_to_num(home_centroid_x_norm, nan=0.0).astype(np.float32)
     else:
-        with np.errstate(invalid="ignore"):
-            h_mean_x = np.nanmean(home_player_xy[:, :, 0], axis=1)
-        h_norm_x = (h_mean_x - half_length) / half_length
-        features[:, 11] = np.clip(np.nan_to_num(h_norm_x, nan=0.0), -1.0, 1.0).astype(np.float32)
+        features[:, 11] = centroid_x_norm(home_player_xy)
 
     if away_centroid_x_norm is not None:
         features[:, 12] = np.nan_to_num(away_centroid_x_norm, nan=0.0).astype(np.float32)
     else:
-        with np.errstate(invalid="ignore"):
-            a_mean_x = np.nanmean(away_player_xy[:, :, 0], axis=1)
-        a_norm_x = (a_mean_x - half_length) / half_length
-        features[:, 12] = np.clip(np.nan_to_num(a_norm_x, nan=0.0), -1.0, 1.0).astype(np.float32)
+        features[:, 12] = centroid_x_norm(away_player_xy)
 
     # 3. Stoppage tag flag (feature 13)
     features[:, 13] = (np.asarray(is_stoppage_tag) > 0.5).astype(np.float32)
 
     # 4. Ball visibility indicator (feature 3)
-    features[:, 3] = visible_mask.astype(np.float32)
+    features[:, BALL_VISIBLE_INDEX] = visible_mask.astype(np.float32)
 
     # When ball is not visible, distances default to sentinel and speeds/positions default to 0.0
-    features[~visible_mask, 0] = MISSING_DIST_SENTINEL  # min_dist_home
-    features[~visible_mask, 1] = MISSING_DIST_SENTINEL  # min_dist_away
-    features[~visible_mask, 2] = 0.0                    # dist_diff
-    features[~visible_mask, 4] = 0.0                    # ball_speed
-    features[~visible_mask, 5] = 0.0                    # ball_x_norm
-    features[~visible_mask, 6] = 0.0                    # ball_y_norm
-    features[~visible_mask, 7] = 0.0                    # closest_home_speed
-    features[~visible_mask, 8] = 0.0                    # closest_away_speed
+    mask_ball_features(features, ~visible_mask)
 
     # For frames where ball is visible, compute exact spatial relationships
     visible_indices = np.flatnonzero(visible_mask)
@@ -168,48 +238,23 @@ def extract_frame_features(
         features[visible_indices, 5] = np.clip(np.nan_to_num(norm_bx, nan=0.0), -1.0, 1.0).astype(np.float32)
         features[visible_indices, 6] = np.clip(np.nan_to_num(norm_by, nan=0.0), -1.0, 1.0).astype(np.float32)
 
-        # Distances to Home outfield players
-        vis_home_xy = home_player_xy[visible_indices]      # shape (V, n_home, 2)
-        vis_home_spd = home_player_speed[visible_indices]  # shape (V, n_home)
-        dx_h = vis_home_xy[:, :, 0] - vis_ball_xy[:, 0:1]
-        dy_h = vis_home_xy[:, :, 1] - vis_ball_xy[:, 1:2]
-        dist_h = np.sqrt(dx_h * dx_h + dy_h * dy_h)
-        dist_h_nan = np.isnan(dist_h)
-        dist_h[dist_h_nan] = np.inf
+        # Distance to, and speed of, the closest outfield player of each team
+        min_d_h, spd_h = _closest_player_stats(
+            home_player_xy[visible_indices], home_player_speed[visible_indices], vis_ball_xy
+        )
+        min_d_a, spd_a = _closest_player_stats(
+            away_player_xy[visible_indices], away_player_speed[visible_indices], vis_ball_xy
+        )
 
-        min_idx_h = np.argmin(dist_h, axis=1)
-        min_d_h = dist_h[np.arange(len(visible_indices)), min_idx_h]
-        no_h = np.isinf(min_d_h)
-        min_d_h[no_h] = MISSING_DIST_SENTINEL
-
-        # Closest Home player speed
-        spd_h = vis_home_spd[np.arange(len(visible_indices)), min_idx_h]
-        spd_h[no_h | np.isnan(spd_h)] = 0.0
-
-        # Distances to Away outfield players
-        vis_away_xy = away_player_xy[visible_indices]      # shape (V, n_away, 2)
-        vis_away_spd = away_player_speed[visible_indices]  # shape (V, n_away)
-        dx_a = vis_away_xy[:, :, 0] - vis_ball_xy[:, 0:1]
-        dy_a = vis_away_xy[:, :, 1] - vis_ball_xy[:, 1:2]
-        dist_a = np.sqrt(dx_a * dx_a + dy_a * dy_a)
-        dist_a_nan = np.isnan(dist_a)
-        dist_a[dist_a_nan] = np.inf
-
-        min_idx_a = np.argmin(dist_a, axis=1)
-        min_d_a = dist_a[np.arange(len(visible_indices)), min_idx_a]
-        no_a = np.isinf(min_d_a)
-        min_d_a[no_a] = MISSING_DIST_SENTINEL
-
-        # Closest Away player speed
-        spd_a = vis_away_spd[np.arange(len(visible_indices)), min_idx_a]
-        spd_a[no_a | np.isnan(spd_a)] = 0.0
-
-        # Assign back
         features[visible_indices, 0] = min_d_h.astype(np.float32)
         features[visible_indices, 1] = min_d_a.astype(np.float32)
         features[visible_indices, 2] = (min_d_a - min_d_h).astype(np.float32)
         features[visible_indices, 7] = spd_h.astype(np.float32)
         features[visible_indices, 8] = spd_a.astype(np.float32)
+
+    # Final safeguard: a non-finite value must never reach a model (no-op on clean inputs)
+    if not np.isfinite(features).all():
+        np.nan_to_num(features, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
     return features
 

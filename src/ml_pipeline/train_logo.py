@@ -12,7 +12,6 @@ Supports:
 
 import argparse
 import os
-import random
 import sys
 from pathlib import Path
 
@@ -32,30 +31,36 @@ import possession_metrics as pm
 from src.ml_pipeline.dataset_open import (
     OpenGameData,
     OpenGameDataset,
+    apply_domain_augmentations,
     generate_ball_dropout_mask,
     load_open_game_data,
+    prepare_masked_game_features,
 )
 from src.ml_pipeline.features import N_FEATURES
-from src.ml_pipeline.models import PossessionLGBM, build_model
+from src.ml_pipeline.inference import (
+    MAX_CPU_THREADS,
+    N_CLASSES,
+    predict_sliding_window_logits,
+    resolve_device,
+    seed_everything,
+    validate_window_args,
+)
+from src.ml_pipeline.models import ARCH_ALIASES, PossessionLGBM, build_model
 from src.ml_pipeline.viterbi import viterbi_decode
 
-
-def seed_everything(seed: int = 42) -> None:
-    """Set random seed across all libraries for deterministic execution."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+# Synthetic ball blackout applied to the held-out game, mirroring the competition feed
+VAL_DROPOUT_RATIO = 0.41
+VAL_DROPOUT_SEED = 42
+N_AUGMENTED_VARIANTS = 2
 
 
 def compute_class_weights(labels_list: list[np.ndarray], device: torch.device) -> torch.Tensor:
     """Compute balanced inverse class frequency weights for CrossEntropyLoss."""
-    all_labels = np.concatenate(labels_list)
-    counts = np.bincount(all_labels, minlength=3).astype(np.float32)
+    all_labels = np.concatenate(labels_list).astype(np.int64)
+    counts = np.bincount(all_labels, minlength=N_CLASSES).astype(np.float32)
     counts = np.maximum(counts, 1.0)
     total = float(len(all_labels))
-    weights = total / (3.0 * counts)
+    weights = total / (float(N_CLASSES) * counts)
     weights = weights / weights.mean()
     return torch.from_numpy(weights).float().to(device)
 
@@ -73,63 +78,10 @@ def temporal_smoothness_loss(logits: torch.Tensor) -> torch.Tensor:
     return torch.mean(diffs * diffs)
 
 
-def predict_full_game_logits(
-    model: nn.Module,
-    features: np.ndarray,
-    device: torch.device,
-    seq_len: int = 250,
-    stride: int = 125,
-    batch_size: int = 64,
-) -> np.ndarray:
-    """Run model inference across full match frames using overlapping window averaging.
-
-    Args:
-        model: Trained PyTorch sequence model.
-        features: Frame features array of shape (n_frames, n_features).
-        device: Torch execution device.
-        seq_len: Slicing sequence length in frames.
-        stride: Slicing step in frames.
-        batch_size: Window batch size.
-
-    Returns:
-        Averaged logits array of shape (n_frames, 3).
-    """
-    model.eval()
-    n_frames = len(features)
-    accum_logits = np.zeros((n_frames, 3), dtype=np.float32)
-    counts = np.zeros(n_frames, dtype=np.float32)
-
-    windows = []
-    spans = []
-    max_start = n_frames - seq_len
-    starts = list(range(0, max_start + 1, stride))
-    if not starts or starts[-1] < max_start:
-        starts.append(max_start)
-
-    for start in starts:
-        end = start + seq_len
-        windows.append(features[start:end])
-        spans.append((start, end))
-
-    with torch.no_grad():
-        for b_start in range(0, len(windows), batch_size):
-            b_end = min(len(windows), b_start + batch_size)
-            batch_data = np.stack(windows[b_start:b_end], axis=0)
-            tensor_x = torch.from_numpy(batch_data).float().to(device)
-            batch_logits = model(tensor_x).cpu().numpy()
-
-            for i, (s, e) in enumerate(spans[b_start:b_end]):
-                accum_logits[s:e] += batch_logits[i]
-                counts[s:e] += 1.0
-
-    counts = np.maximum(counts, 1.0)[:, None]
-    return accum_logits / counts
-
-
 def evaluate_game(
-    model: nn.Module,
+    model: nn.Module | PossessionLGBM,
     game: OpenGameData,
-    device: torch.device,
+    device: torch.device | None = None,
     seq_len: int = 250,
     stride: int = 125,
     trans_penalty_ha: float = 3.0,
@@ -137,16 +89,16 @@ def evaluate_game(
     abstain_threshold: float = 0.45,
     enable_abstention: bool = True,
     apply_synthetic_dropout: bool = True,
-    dropout_seed: int = 42,
+    dropout_seed: int = VAL_DROPOUT_SEED,
 ) -> dict:
-    """Evaluate model on a full game with synthetic 41% ball blackout and Viterbi decoding.
+    """Evaluate a model on a full game with synthetic 41% ball blackout and Viterbi decoding.
 
     Args:
-        model: PyTorch model in eval mode.
+        model: PyTorch sequence model or fitted PossessionLGBM.
         game: OpenGameData container for the held-out match with precomputed features.
-        device: Torch execution device.
-        seq_len: Slicing window length.
-        stride: Slicing window step.
+        device: Torch execution device (required for PyTorch models, ignored for LightGBM).
+        seq_len: Slicing window length (PyTorch models only).
+        stride: Slicing window step (PyTorch models only).
         trans_penalty_ha: Viterbi transition penalty between H and A.
         trans_penalty_dead: Viterbi transition penalty for Dead Ball D.
         abstain_threshold: Confidence threshold below which unobserved ball frames abstain.
@@ -157,48 +109,41 @@ def evaluate_game(
     Returns:
         Evaluation dictionary from official evaluation/possession_metrics.py.
     """
-    n_frames = game.n_frames
-    ball_vis = game.is_ball_visible.copy()
-
-    if apply_synthetic_dropout:
-        val_dropout_mask = generate_ball_dropout_mask(n_frames, target_ratio=0.41, seed=dropout_seed)
-        ball_vis = ball_vis & ~val_dropout_mask
-
-    # Fast feature masking from precomputed base features (< 2 ms)
-    val_features = game.features.copy()
-    masked = ~ball_vis
-    val_features[masked, 0] = 50.0  # min_dist_home
-    val_features[masked, 1] = 50.0  # min_dist_away
-    val_features[masked, 2] = 0.0   # dist_diff
-    val_features[masked, 3] = 0.0   # is_ball_visible
-    val_features[masked, 4] = 0.0   # ball_speed
-    val_features[masked, 5] = 0.0   # ball_x_norm
-    val_features[masked, 6] = 0.0   # ball_y_norm
-    val_features[masked, 7] = 0.0   # closest_home_speed
-    val_features[masked, 8] = 0.0   # closest_away_speed
-
-    # Predict full game logits
-    logits = predict_full_game_logits(
-        model=model,
-        features=val_features,
-        device=device,
-        seq_len=seq_len,
-        stride=stride,
+    val_features, ball_vis = prepare_masked_game_features(
+        game,
+        target_ratio=VAL_DROPOUT_RATIO,
+        seed=dropout_seed,
+        apply_synthetic_dropout=apply_synthetic_dropout,
     )
+
+    if isinstance(model, PossessionLGBM):
+        emissions = model.predict_proba(val_features)  # probabilities (n_frames, 3)
+        emission_type = "probs"
+    else:
+        if device is None:
+            raise ValueError("A torch device is required to evaluate a PyTorch sequence model.")
+        emissions = predict_sliding_window_logits(
+            model=model,
+            features=val_features,
+            device=device,
+            seq_len=seq_len,
+            stride=stride,
+        )
+        emission_type = "logits"
 
     # Decode via Numba-accelerated Viterbi
     pred_codes = viterbi_decode(
-        emissions=logits,
+        emissions=emissions,
         is_ball_visible=ball_vis,
         trans_penalty_ha=trans_penalty_ha,
         trans_penalty_dead=trans_penalty_dead,
         abstain_threshold=abstain_threshold,
         enable_abstention=enable_abstention,
+        emission_type=emission_type,
     )
 
     # Score against official metrics
-    metrics = pm.evaluate(game.gt_labels, pred_codes)
-    return metrics
+    return pm.evaluate(game.gt_labels, pred_codes)
 
 
 def create_augmented_game_variants(
@@ -221,127 +166,36 @@ def create_augmented_game_variants(
         List of (features, labels) tuples containing the original game and augmented copies.
     """
     variants = [(game.features.copy(), game.gt_labels.copy())]
-    n_frames = game.n_frames
 
     for v_idx in range(1, n_augmented + 1):
         v_seed = seed + v_idx * 1000
-        rng = np.random.RandomState(v_seed)
-        feat = game.features.copy()
-        labels = game.gt_labels.copy()
-
-        # 1. 41% synthetic ball occlusion dropout
-        drop_mask = generate_ball_dropout_mask(n_frames, target_ratio=dropout_ratio, seed=v_seed)
-        masked = drop_mask | (feat[:, 3] < 0.5)
-
-        feat[masked, 0] = 50.0  # min_dist_home
-        feat[masked, 1] = 50.0  # min_dist_away
-        feat[masked, 2] = 0.0   # dist_diff
-        feat[masked, 3] = 0.0   # is_ball_visible
-        feat[masked, 4] = 0.0   # ball_speed
-        feat[masked, 5] = 0.0   # ball_x_norm
-        feat[masked, 6] = 0.0   # ball_y_norm
-        feat[masked, 7] = 0.0   # closest_home_speed
-        feat[masked, 8] = 0.0   # closest_away_speed
-
-        # Coordinate jitter on visible frames
-        vis = ~masked
-        n_vis = int(vis.sum())
-        if n_vis > 0:
-            jitter_h = rng.normal(0.0, jitter_sigma, size=n_vis).astype(np.float32)
-            jitter_a = rng.normal(0.0, jitter_sigma, size=n_vis).astype(np.float32)
-            feat[vis, 0] = np.maximum(0.1, feat[vis, 0] + jitter_h)
-            feat[vis, 1] = np.maximum(0.1, feat[vis, 1] + jitter_a)
-            feat[vis, 2] = feat[vis, 1] - feat[vis, 0]
-
-            jx_norm = rng.normal(0.0, jitter_sigma / 52.65, size=n_vis).astype(np.float32)
-            jy_norm = rng.normal(0.0, jitter_sigma / 34.0, size=n_vis).astype(np.float32)
-            feat[vis, 5] = np.clip(feat[vis, 5] + jx_norm, -1.0, 1.0)
-            feat[vis, 6] = np.clip(feat[vis, 6] + jy_norm, -1.0, 1.0)
-
-            spd_j = rng.normal(0.0, 0.2, size=n_vis).astype(np.float32)
-            feat[vis, 4] = np.maximum(0.0, feat[vis, 4] + spd_j)
-
-        # 2. Random Home <-> Away channel and label swap
-        if rng.rand() < 0.5:
-            tmp0 = feat[:, 0].copy()
-            feat[:, 0] = feat[:, 1]
-            feat[:, 1] = tmp0
-
-            feat[:, 2] = -feat[:, 2]
-
-            tmp7 = feat[:, 7].copy()
-            feat[:, 7] = feat[:, 8]
-            feat[:, 8] = tmp7
-
-            tmp11 = feat[:, 11].copy()
-            feat[:, 11] = feat[:, 12]
-            feat[:, 12] = tmp11
-
-            swapped = labels.copy()
-            swapped[labels == 0] = 1
-            swapped[labels == 1] = 0
-            labels = swapped
-
-        # 3. Pitch coordinate reflection
-        if rng.rand() < 0.5:
-            feat[:, 5] = -feat[:, 5]
-            feat[:, 11] = -feat[:, 11]
-            feat[:, 12] = -feat[:, 12]
-
-        if rng.rand() < 0.5:
-            feat[:, 6] = -feat[:, 6]
-
-        variants.append((feat, labels))
+        drop_mask = generate_ball_dropout_mask(game.n_frames, target_ratio=dropout_ratio, seed=v_seed)
+        variants.append(
+            apply_domain_augmentations(
+                game.features.copy(),
+                game.gt_labels.copy(),
+                drop_mask,
+                rng=np.random.RandomState(v_seed),
+                jitter_sigma=jitter_sigma,
+            )
+        )
 
     return variants
 
 
-def evaluate_lgbm_game(
-    model: PossessionLGBM,
-    game: OpenGameData,
-    trans_penalty_ha: float = 3.0,
-    trans_penalty_dead: float = 2.0,
-    abstain_threshold: float = 0.45,
-    enable_abstention: bool = True,
-    apply_synthetic_dropout: bool = True,
-    dropout_seed: int = 42,
-) -> dict:
-    """Evaluate LightGBM model on a full game with synthetic 41% ball blackout and Viterbi decoding."""
-    n_frames = game.n_frames
-    ball_vis = game.is_ball_visible.copy()
-
-    if apply_synthetic_dropout:
-        val_dropout_mask = generate_ball_dropout_mask(n_frames, target_ratio=0.41, seed=dropout_seed)
-        ball_vis = ball_vis & ~val_dropout_mask
-
-    val_features = game.features.copy()
-    masked = ~ball_vis
-    val_features[masked, 0] = 50.0  # min_dist_home
-    val_features[masked, 1] = 50.0  # min_dist_away
-    val_features[masked, 2] = 0.0   # dist_diff
-    val_features[masked, 3] = 0.0   # is_ball_visible
-    val_features[masked, 4] = 0.0   # ball_speed
-    val_features[masked, 5] = 0.0   # ball_x_norm
-    val_features[masked, 6] = 0.0   # ball_y_norm
-    val_features[masked, 7] = 0.0   # closest_home_speed
-    val_features[masked, 8] = 0.0   # closest_away_speed
-
-    # Predict full game probabilities (n_frames, 3)
-    probs = model.predict_proba(val_features)
-
-    # Decode via Numba-accelerated Viterbi
-    pred_codes = viterbi_decode(
-        emissions=probs,
-        is_ball_visible=ball_vis,
-        trans_penalty_ha=trans_penalty_ha,
-        trans_penalty_dead=trans_penalty_dead,
-        abstain_threshold=abstain_threshold,
-        enable_abstention=enable_abstention,
-    )
-
-    # Score against official metrics
-    metrics = pm.evaluate(game.gt_labels, pred_codes)
-    return metrics
+def _print_split_header(
+    title: str,
+    train_games: list[OpenGameData],
+    val_game: OpenGameData | None,
+    train_note: str = "",
+) -> None:
+    """Print the banner describing one training split."""
+    print(f"\n{'='*70}", flush=True)
+    print(title, flush=True)
+    print(f"Train games: {[g.game_id for g in train_games]}{train_note}", flush=True)
+    if val_game is not None:
+        print(f"Validation game: {val_game.game_id}", flush=True)
+    print(f"{'='*70}", flush=True)
 
 
 def train_lgbm_split(
@@ -351,24 +205,24 @@ def train_lgbm_split(
     fold_name: str,
 ) -> tuple[PossessionLGBM, dict | None]:
     """Train LightGBM on domain-augmented game variants and evaluate on held-out game."""
-    print(f"\n{'='*70}", flush=True)
-    print(f"Training LightGBM split: {fold_name}", flush=True)
-    print(f"Train games: {[g.game_id for g in train_games]} (with 2 augmented variants each)", flush=True)
-    if val_game:
-        print(f"Validation game: {val_game.game_id}", flush=True)
-    print(f"{'='*70}", flush=True)
+    _print_split_header(
+        f"Training LightGBM split: {fold_name}",
+        train_games,
+        val_game,
+        train_note=f" (with {N_AUGMENTED_VARIANTS} augmented variants each)",
+    )
 
     train_feats_list = []
     train_labs_list = []
     for g in train_games:
-        for feat_v, lab_v in create_augmented_game_variants(g, n_augmented=2, seed=args.seed):
+        for feat_v, lab_v in create_augmented_game_variants(g, n_augmented=N_AUGMENTED_VARIANTS, seed=args.seed):
             train_feats_list.append(feat_v)
             train_labs_list.append(lab_v)
 
     n_total_frames = sum(len(f) for f in train_feats_list)
     print(f"Fitting LightGBM on {len(train_feats_list)} sequences ({n_total_frames} total frames)...", flush=True)
 
-    n_threads = min(4, os.cpu_count() or 4)
+    n_threads = min(MAX_CPU_THREADS, os.cpu_count() or MAX_CPU_THREADS)
     model = PossessionLGBM(
         n_estimators=450,
         learning_rate=0.05,
@@ -388,15 +242,12 @@ def train_lgbm_split(
     val_metrics = None
     if val_game is not None:
         print(f"Evaluating held-out game ({val_game.game_id}) under deterministic 41% synthetic ball dropout...", flush=True)
-        val_metrics = evaluate_lgbm_game(
+        val_metrics = evaluate_game(
             model=model,
             game=val_game,
             trans_penalty_ha=args.trans_penalty_ha,
             trans_penalty_dead=args.trans_penalty_dead,
             abstain_threshold=args.abstain_threshold,
-            enable_abstention=True,
-            apply_synthetic_dropout=True,
-            dropout_seed=42,
         )
         score = val_metrics["spell_f1_mean"]
         macro_f1 = val_metrics["macro_f1"]
@@ -418,12 +269,7 @@ def train_single_split(
     fold_name: str,
 ) -> tuple[nn.Module, dict | None]:
     """Train model on a subset of games and evaluate on held-out game."""
-    print(f"\n{'='*70}", flush=True)
-    print(f"Training split: {fold_name}", flush=True)
-    print(f"Train games: {[g.game_id for g in train_games]}", flush=True)
-    if val_game:
-        print(f"Validation game: {val_game.game_id}", flush=True)
-    print(f"{'='*70}", flush=True)
+    _print_split_header(f"Training split: {fold_name}", train_games, val_game)
 
     train_ds = OpenGameDataset(
         games=train_games,
@@ -438,6 +284,11 @@ def train_single_split(
         drop_last=True,
         num_workers=0,
     )
+    if len(train_loader) == 0:
+        raise ValueError(
+            f"No full training batch available: {len(train_ds)} window(s) of {args.seq_len} frames "
+            f"with batch size {args.batch_size}. Lower --batch-size or --seq-len."
+        )
 
     class_weights = compute_class_weights([g.gt_labels for g in train_games], device)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
@@ -470,7 +321,7 @@ def train_single_split(
             optimizer.zero_grad()
             logits = model(x_b)  # (batch, seq_len, 3)
 
-            ce_loss = criterion(logits.reshape(-1, 3), y_b.reshape(-1))
+            ce_loss = criterion(logits.reshape(-1, N_CLASSES), y_b.reshape(-1))
             smooth_loss = temporal_smoothness_loss(logits)
             loss = ce_loss + args.smooth_weight * smooth_loss
 
@@ -524,11 +375,53 @@ def train_single_split(
     return model, best_metrics
 
 
-def main():
+def _save_torch_checkpoint(
+    model: nn.Module,
+    ckpt_file: Path,
+    args: argparse.Namespace,
+    **extra_metadata,
+) -> None:
+    """Save model weights together with the architecture metadata needed to rebuild the model."""
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "arch": args.arch,
+        "input_dim": N_FEATURES,
+        "hidden_size": args.hidden_size,
+        "num_layers": args.num_layers,
+        "dropout": args.dropout,
+        "num_classes": N_CLASSES,
+        **extra_metadata,
+    }, ckpt_file)
+
+
+def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Reject invalid CLI values up front with a readable message."""
+    args.arch = args.arch.lower().strip()
+    if args.arch not in ARCH_ALIASES:
+        parser.error(f"--arch '{args.arch}' is not supported; choose one of {sorted(ARCH_ALIASES)}")
+    try:
+        validate_window_args(args.seq_len, args.stride, args.batch_size)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.epochs < 1 or args.eval_every < 1:
+        parser.error("--epochs and --eval-every must be >= 1")
+    if args.lr <= 0 or args.weight_decay < 0 or args.smooth_weight < 0:
+        parser.error("--lr must be > 0; --weight-decay and --smooth-weight must be >= 0")
+    if args.hidden_size < 1 or args.num_layers < 1 or not 0.0 <= args.dropout < 1.0:
+        parser.error("--hidden-size and --num-layers must be >= 1 and --dropout must lie in [0, 1)")
+    if args.trans_penalty_ha < 0 or args.trans_penalty_dead < 0:
+        parser.error("--trans-penalty-ha and --trans-penalty-dead must be >= 0")
+    if not 0.0 <= args.abstain_threshold <= 1.0:
+        parser.error("--abstain-threshold must lie in [0, 1]")
+
+
+def main() -> None:
+    """Parse CLI arguments and run LOGO cross-validation or full training."""
     parser = argparse.ArgumentParser(description="Train and validate possession sequence models.")
     parser.add_argument("--mode", type=str, choices=["logo", "full"], default="logo",
                         help="'logo' for 3-fold Leave-One-Game-Out CV, 'full' for full training.")
-    parser.add_argument("--arch", type=str, default="bi_gru", help="Model architecture (default: bi_gru, lgbm).")
+    parser.add_argument("--arch", type=str, default="bi_gru",
+                        help="Model architecture: 'bi_gru', 'tcn_1d' or 'lgbm' (default: bi_gru).")
     parser.add_argument("--epochs", type=int, default=15, help="Number of epochs (default: 15).")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size (default: 32).")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (default: 1e-3).")
@@ -548,19 +441,13 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42).")
     parser.add_argument("--device", type=str, default=None, help="'cuda', 'cpu', or None for auto.")
     args = parser.parse_args()
+    _validate_args(parser, args)
 
     seed_everything(args.seed)
-
-    if args.device:
-        device = torch.device(args.device)
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}", flush=True)
-
-    if device.type == "cpu":
-        n_threads = min(4, os.cpu_count() or 4)
-        torch.set_num_threads(n_threads)
-        print(f"Configured PyTorch CPU threads: {n_threads}", flush=True)
+    try:
+        device = resolve_device(args.device)
+    except ValueError as error:
+        parser.error(str(error))
 
     output_path = Path(args.output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -571,11 +458,10 @@ def main():
     for g in games:
         print(f"  {g.game_id}: {g.n_frames} frames ({g.n_frames / g.fps / 60.0:.1f} mins)", flush=True)
 
-    is_lgbm = args.arch.lower().strip() in ("lgbm", "lightgbm")
+    is_lgbm = ARCH_ALIASES[args.arch] == "lgbm"
 
     if args.mode == "logo":
-        fold_scores = []
-        macro_scores = []
+        fold_results: list[tuple[str, dict]] = []
 
         folds = [
             ("fold_1", [games[1], games[2]], games[0]),  # Train on 2 & 3, val on 1
@@ -604,22 +490,11 @@ def main():
                 )
                 # Save fold checkpoint
                 ckpt_file = output_path / f"{args.arch}_{fname}.pt"
-                torch.save({
-                    "model_state_dict": model.state_dict(),
-                    "arch": args.arch,
-                    "input_dim": N_FEATURES,
-                    "hidden_size": args.hidden_size,
-                    "num_layers": args.num_layers,
-                    "dropout": args.dropout,
-                    "num_classes": 3,
-                    "val_game": val_g.game_id,
-                    "val_metrics": metrics,
-                }, ckpt_file)
+                _save_torch_checkpoint(model, ckpt_file, args, val_game=val_g.game_id, val_metrics=metrics)
                 print(f"Saved checkpoint: {ckpt_file}", flush=True)
 
             if metrics:
-                fold_scores.append(metrics["spell_f1_mean"])
-                macro_scores.append(metrics["macro_f1"])
+                fold_results.append((val_g.game_id, metrics))
 
         print(f"\n{'='*70}", flush=True)
         summary_title = "LEAVE-ONE-GAME-OUT (LOGO) CV RESULTS SUMMARY"
@@ -627,11 +502,20 @@ def main():
             summary_title += " (LightGBM)"
         print(summary_title, flush=True)
         print(f"{'='*70}", flush=True)
-        for i, (fname, _, val_g) in enumerate(folds):
-            print(f"Fold {i+1} (Val: {val_g.game_id}): Spell F1 = {fold_scores[i]:.4f} | Macro F1 = {macro_scores[i]:.4f}", flush=True)
-        print(f"{'-'*70}", flush=True)
-        print(f"Mean CV Spell F1: {np.mean(fold_scores):.4f} (+/- {np.std(fold_scores):.4f})", flush=True)
-        print(f"Mean CV Macro F1: {np.mean(macro_scores):.4f} (+/- {np.std(macro_scores):.4f})", flush=True)
+        if not fold_results:
+            print("No fold produced validation metrics.", flush=True)
+        else:
+            fold_scores = [m["spell_f1_mean"] for _, m in fold_results]
+            macro_scores = [m["macro_f1"] for _, m in fold_results]
+            for i, (game_id, _) in enumerate(fold_results):
+                print(
+                    f"Fold {i+1} (Val: {game_id}): Spell F1 = {fold_scores[i]:.4f} | "
+                    f"Macro F1 = {macro_scores[i]:.4f}",
+                    flush=True,
+                )
+            print(f"{'-'*70}", flush=True)
+            print(f"Mean CV Spell F1: {np.mean(fold_scores):.4f} (+/- {np.std(fold_scores):.4f})", flush=True)
+            print(f"Mean CV Macro F1: {np.mean(macro_scores):.4f} (+/- {np.std(macro_scores):.4f})", flush=True)
         print(f"{'='*70}", flush=True)
 
     elif args.mode == "full":
@@ -654,15 +538,7 @@ def main():
                 fold_name="full_3_games",
             )
             ckpt_file = output_path / f"{args.arch}_full.pt"
-            torch.save({
-                "model_state_dict": model.state_dict(),
-                "arch": args.arch,
-                "input_dim": N_FEATURES,
-                "hidden_size": args.hidden_size,
-                "num_layers": args.num_layers,
-                "dropout": args.dropout,
-                "num_classes": 3,
-            }, ckpt_file)
+            _save_torch_checkpoint(model, ckpt_file, args)
             print(f"\nSaved full model checkpoint: {ckpt_file}", flush=True)
 
 

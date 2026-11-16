@@ -5,22 +5,39 @@ and provides fast streaming extraction of raw Automatic Tracking Data (ATD) into
 arrays, including goalkeeper and non-outfield role filtering.
 """
 
+import warnings
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict, Any
-import xml.etree.ElementTree as ET
+from typing import Optional, Tuple
 
 import numpy as np
 
-# Official starter loaders and constants
-from starter.load_atd import video_frame_of, atd_paths
-from games import GAME, DEFAULT_SOURCE
+# Official starter frame alignment
+from starter.load_atd import video_frame_of
 
 HOME_CODE = 0
 AWAY_CODE = 1
+UNASSIGNED_TEAM_CODE = -1
 FIELD_SEP = ":"
 GROUP_SEP = ";"
 MISSING_CHAR = "N"
+
+
+def _parse_xy_speed(group: str) -> Optional[Tuple[float, float, float]]:
+    """Parse one 'x,y,speed' record; None when it is missing or malformed."""
+    if not group or group[0] == MISSING_CHAR:
+        return None
+    c1 = group.find(",")
+    if c1 == -1:
+        return None
+    c2 = group.find(",", c1 + 1)
+    if c2 == -1:
+        return None
+    try:
+        return float(group[:c1]), float(group[c1 + 1 : c2]), float(group[c2 + 1 :])
+    except ValueError:
+        return None
 
 
 @dataclass
@@ -28,7 +45,7 @@ class RawTrackingData:
     """Container for parsed match tracking arrays."""
     n_frames: int
     pitch: Tuple[float, float]
-    team_of_track: np.ndarray        # shape (n_slots,), int8 (0 = Home, 1 = Away)
+    team_of_track: np.ndarray        # shape (n_slots,), int8 (0 = Home, 1 = Away, -1 = neither team)
     team_names: Tuple[str, str]      # (Home name, Away name)
     is_outfield_slot: np.ndarray     # shape (n_slots,), bool (True for outfield players)
     ball_xy: np.ndarray              # shape (n_frames, 2), float32 in metres (NaN if missing)
@@ -74,7 +91,10 @@ def parse_atd_metadata(meta_path: Path) -> Tuple[np.ndarray, Tuple[str, str], np
     for score_elm in root.iter("Score"):
         local_id = score_elm.get("idLocalTeam")
         visiting_id = score_elm.get("idVisitingTeam")
-        if local_id and visiting_id:
+        if (
+            local_id and visiting_id and local_id != visiting_id
+            and local_id in team_name_map and visiting_id in team_name_map
+        ):
             home_id = local_id
             away_id = visiting_id
             break
@@ -92,14 +112,16 @@ def parse_atd_metadata(meta_path: Path) -> Tuple[np.ndarray, Tuple[str, str], np
         raise ValueError(f"No player elements found in metadata {meta_path}")
 
     n_slots = len(player_elements)
-    team_of_track = np.full(n_slots, AWAY_CODE, dtype=np.int8)
+    team_of_track = np.full(n_slots, UNASSIGNED_TEAM_CODE, dtype=np.int8)
     is_outfield_slot = np.ones(n_slots, dtype=bool)
 
     for slot_idx, player_elm in enumerate(player_elements):
+        # Slots that belong to neither club (e.g. officials) stay unassigned instead of
+        # silently counting as Away players
         tid = player_elm.get("teamId")
         if tid == home_id:
             team_of_track[slot_idx] = HOME_CODE
-        else:
+        elif tid == away_id:
             team_of_track[slot_idx] = AWAY_CODE
 
         # Role detection: check ProviderParameter for position_index == 0 (Goalkeeper)
@@ -155,42 +177,52 @@ def load_raw_tracking_data(
             if len(parts) != 3:
                 continue
 
-            frame_id = int(parts[0])
-            frame_idx = video_frame_of(frame_id)
+            try:
+                frame_idx = video_frame_of(parts[0])
+            except ValueError:
+                continue  # not a tracking record (blank or malformed frame id)
             if frame_idx < 0 or frame_idx >= n_expected_frames:
                 continue
 
             # Parse ball: "x,y,speed"
-            ball_str = parts[2]
-            if ball_str and ball_str[0] != MISSING_CHAR:
-                c1 = ball_str.find(",")
-                if c1 != -1:
-                    c2 = ball_str.find(",", c1 + 1)
-                    if c2 != -1:
-                        ball_xy[frame_idx, 0] = float(ball_str[:c1]) * pitch_length
-                        ball_xy[frame_idx, 1] = float(ball_str[c1 + 1 : c2]) * pitch_width
-                        ball_speed[frame_idx] = float(ball_str[c2 + 1 :])
+            ball = _parse_xy_speed(parts[2])
+            if ball is not None:
+                ball_xy[frame_idx, 0] = ball[0] * pitch_length
+                ball_xy[frame_idx, 1] = ball[1] * pitch_width
+                ball_speed[frame_idx] = ball[2]
 
-            # Parse players: "x,y,speed;x,y,speed;..."
+            # Parse players: "x,y,speed;x,y,speed;...". Inlined (rather than calling
+            # _parse_xy_speed) because this is the hot loop: ~9 million records per match.
             player_groups = parts[1].split(GROUP_SEP)
-            for slot_idx, group in enumerate(player_groups):
-                if slot_idx >= n_slots:
-                    break
-                if group and group[0] != MISSING_CHAR:
-                    c1 = group.find(",")
-                    if c1 != -1:
-                        c2 = group.find(",", c1 + 1)
-                        if c2 != -1:
-                            player_xy[frame_idx, slot_idx, 0] = float(group[:c1]) * pitch_length
-                            player_xy[frame_idx, slot_idx, 1] = float(group[c1 + 1 : c2]) * pitch_width
-                            player_speed[frame_idx, slot_idx] = float(group[c2 + 1 :])
+            for slot_idx, group in enumerate(player_groups[:n_slots]):
+                if not group or group[0] == MISSING_CHAR:
+                    continue
+                c1 = group.find(",")
+                if c1 == -1:
+                    continue
+                c2 = group.find(",", c1 + 1)
+                if c2 == -1:
+                    continue
+                try:
+                    x, y, speed = float(group[:c1]), float(group[c1 + 1 : c2]), float(group[c2 + 1 :])
+                except ValueError:
+                    continue  # malformed record: leave the slot missing for this frame
+                player_xy[frame_idx, slot_idx, 0] = x * pitch_length
+                player_xy[frame_idx, slot_idx, 1] = y * pitch_width
+                player_speed[frame_idx, slot_idx] = speed
 
-    # Outfield slot mask: if no slots were marked non-outfield by metadata,
-    # find goalkeepers empirically (players who stay in goal area x < 12 or x > pitch_length - 12)
+    # A position is only usable when both coordinates are finite; +/-Inf never propagates
+    ball_xy[~np.isfinite(ball_xy).all(axis=1)] = np.nan
+    player_xy[~np.isfinite(player_xy).all(axis=2)] = np.nan
+    ball_speed[~np.isfinite(ball_speed)] = np.nan
+    player_speed[~np.isfinite(player_speed)] = np.nan
+
+    # Outfield slot mask: if no slots were marked non-outfield by metadata, find goalkeepers
+    # empirically (players whose median x stays within 14 m of either goal line)
     outfield_indices = np.flatnonzero(is_outfield_slot)
     if len(outfield_indices) == n_slots and n_slots >= 22:
-        # Detect goalkeepers by median x position near goal lines
-        with np.errstate(invalid="ignore"):
+        with np.errstate(invalid="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)  # never-tracked slots
             median_x = np.nanmedian(player_xy[:, :, 0], axis=0)
         potential_gk = np.flatnonzero((median_x < 14.0) | (median_x > pitch_length - 14.0))
         if len(potential_gk) >= 2:
@@ -200,7 +232,8 @@ def load_raw_tracking_data(
     # Compute collective outfield player speed statistics (mean and 80th percentile)
     if len(outfield_indices) > 0:
         outfield_speeds = player_speed[:, outfield_indices]
-        with np.errstate(invalid="ignore"):
+        with np.errstate(invalid="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)  # frames with no tracked player
             mean_player_speed = np.nanmean(outfield_speeds, axis=1)
             p80_player_speed = np.nanpercentile(outfield_speeds, 80, axis=1)
         mean_player_speed = np.nan_to_num(mean_player_speed, nan=0.0).astype(np.float32)

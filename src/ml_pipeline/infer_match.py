@@ -6,10 +6,14 @@ runs model inference (single checkpoint, heterogeneous ensemble, or LOGO 3-fold 
 optionally fuses physical dead-ball detections with neural emission distributions,
 decodes each half independently via Viterbi decoding, validates format,
 and writes submission to results/lamasia_helvetia_*.csv.
+
+Halves are processed in complete isolation: sliding windows, temporal feature expansion and
+Viterbi state never cross the halftime break, and every frame outside the two halves
+(pre-match, halftime, post-match) is written as Dead Ball ('D').
 """
 
 import argparse
-import os
+import math
 import sys
 from pathlib import Path
 
@@ -37,108 +41,28 @@ from games import (
 from src.ball_tracking import reconstruct_ball_trajectory
 from src.config import PipelineConfig
 from src.data_loader import load_raw_tracking_data
-from src.dead_ball import (
-    STOPPAGE_CODES,
-    STOPPAGE_SET_PIECE_TYPES,
-    detect_dead_ball,
-)
+from src.dead_ball import build_stoppage_tag_mask, detect_dead_ball
 from src.ml_pipeline.features import (
-    N_FEATURES,
+    BALL_VISIBLE_INDEX,
     extract_frame_features_from_tracking,
 )
-from src.ml_pipeline.models import PossessionLGBM, build_model
-from src.ml_pipeline.viterbi import codes_to_labels, viterbi_decode
+from src.ml_pipeline.inference import (
+    N_CLASSES,
+    load_model_from_checkpoint,
+    predict_sliding_window_probabilities,
+    resolve_device,
+    seed_everything,
+    validate_window_args,
+)
+from src.ml_pipeline.models import ARCH_ALIASES, PossessionLGBM
+from src.ml_pipeline.viterbi import LABEL_TO_CODE, codes_to_labels, viterbi_decode
 from starter.load_smart_tagging import load as load_smart_tagging_events
 
-
-def load_model_from_checkpoint(
-    checkpoint_path: str | Path,
-    device: torch.device,
-) -> nn.Module | PossessionLGBM:
-    """Load model architecture and weights from saved checkpoint file (.pt or .joblib).
-
-    Supports:
-    - PyTorch sequence models (PossessionBiGRU, PossessionTCN1D) saved as .pt
-    - LightGBM tabular models (PossessionLGBM) saved as .joblib
-    """
-    p = Path(checkpoint_path)
-    if p.suffix == ".joblib" or "lgbm" in p.name.lower():
-        return PossessionLGBM.load(p)
-
-    ckpt = torch.load(p, map_location=device)
-    arch = ckpt.get("arch")
-    if not arch:
-        p_str = str(p).lower()
-        if "tcn" in p_str:
-            arch = "tcn_1d"
-        else:
-            arch = "bi_gru"
-
-    hidden_size = ckpt.get("hidden_size", 96)
-    num_layers = ckpt.get("num_layers", 2)
-    dropout = ckpt.get("dropout", 0.25)
-    input_dim = ckpt.get("input_dim", N_FEATURES)
-    num_classes = ckpt.get("num_classes", 3)
-
-    model = build_model(
-        arch=arch,
-        input_dim=input_dim,
-        hidden_size=hidden_size,
-        num_layers=num_layers,
-        dropout=dropout,
-        num_classes=num_classes,
-    )
-    if isinstance(model, nn.Module):
-        model = model.to(device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        model.eval()
-    return model
-
-
-def predict_pytorch_probabilities(
-    model: nn.Module,
-    features: np.ndarray,
-    device: torch.device,
-    seq_len: int = 250,
-    stride: int = 125,
-    batch_size: int = 64,
-) -> np.ndarray:
-    """Predict per-frame softmax probabilities using PyTorch sliding window model."""
-    model.eval()
-    n_frames = len(features)
-    accum_logits = np.zeros((n_frames, 3), dtype=np.float32)
-    counts = np.zeros(n_frames, dtype=np.float32)
-
-    windows = []
-    spans = []
-    max_start = n_frames - seq_len
-    starts = list(range(0, max_start + 1, stride))
-    if not starts or starts[-1] < max_start:
-        starts.append(max_start)
-
-    for start in starts:
-        end = start + seq_len
-        windows.append(features[start:end])
-        spans.append((start, end))
-
-    with torch.no_grad():
-        for b_start in range(0, len(windows), batch_size):
-            b_end = min(len(windows), b_start + batch_size)
-            batch_data = np.stack(windows[b_start:b_end], axis=0)
-            tensor_x = torch.from_numpy(batch_data).float().to(device)
-            batch_logits = model(tensor_x).cpu().numpy()
-
-            for i, (s, e) in enumerate(spans[b_start:b_end]):
-                accum_logits[s:e] += batch_logits[i]
-                counts[s:e] += 1.0
-
-    counts = np.maximum(counts, 1.0)[:, None]
-    avg_logits = accum_logits / counts
-
-    # Compute per-frame softmax probabilities
-    shift = avg_logits - np.max(avg_logits, axis=-1, keepdims=True)
-    exp_vals = np.exp(shift)
-    return (exp_vals / np.sum(exp_vals, axis=-1, keepdims=True)).astype(np.float32)
+DEAD_BALL_CODE = LABEL_TO_CODE["D"]
+# Probability floor before taking logs: keeps every emission finite (log(1e-7) ~ -16.1)
+MIN_EMISSION_PROB = 1e-7
+INFERENCE_SEED = 42
+N_LOGO_FOLDS = 3
 
 
 def predict_half_probabilities(
@@ -150,15 +74,19 @@ def predict_half_probabilities(
     stride: int = 125,
     batch_size: int = 64,
 ) -> np.ndarray:
-    """Predict probabilities across a half, computing weighted average across models."""
+    """Predict probabilities across a half, computing weighted average across models.
+
+    Returns:
+        Weighted probabilities of shape (n_frames, 3), dtype float32.
+    """
     n_frames = len(features)
-    weighted_probs = np.zeros((n_frames, 3), dtype=np.float32)
+    weighted_probs = np.zeros((n_frames, N_CLASSES), dtype=np.float32)
 
     for model, w in zip(models, weights):
         if isinstance(model, PossessionLGBM):
             m_probs = model.predict_proba(features)
         else:
-            m_probs = predict_pytorch_probabilities(
+            m_probs = predict_sliding_window_probabilities(
                 model=model,
                 features=features,
                 device=device,
@@ -171,7 +99,71 @@ def predict_half_probabilities(
     return weighted_probs
 
 
-def main():
+def fuse_dead_ball_evidence(
+    probs: np.ndarray,
+    is_dead: np.ndarray | None = None,
+    dead_ball_boost: float = 0.0,
+) -> np.ndarray:
+    """Convert ensemble probabilities to log-scores, optionally fused with physical D evidence.
+
+    Probabilities are floored at MIN_EMISSION_PROB before the log, so the result is always
+    finite. When a physical dead-ball mask is given, the Dead Ball log-score is raised by
+    dead_ball_boost on flagged frames and lowered by half of it elsewhere. The result is an
+    unnormalized log-score matrix: decode it with emission_type='logits'.
+
+    Args:
+        probs: Ensemble probabilities of shape (n_frames, 3) for states (H, A, D).
+        is_dead: Optional boolean mask of shape (n_frames,) from the kinematic detector.
+        dead_ball_boost: Non-negative log-score boost for the Dead Ball state.
+
+    Returns:
+        Log-score matrix of shape (n_frames, 3), dtype float32.
+    """
+    log_scores = np.log(np.clip(probs, MIN_EMISSION_PROB, 1.0)).astype(np.float32)
+    if is_dead is not None:
+        is_dead = np.asarray(is_dead, dtype=bool)
+        log_scores[is_dead, DEAD_BALL_CODE] += dead_ball_boost
+        log_scores[~is_dead, DEAD_BALL_CODE] -= 0.5 * dead_ball_boost
+    return log_scores
+
+
+def resolve_checkpoints(args: argparse.Namespace) -> tuple[list[Path], list[float]]:
+    """Resolve the checkpoint list and normalized ensemble weights from CLI arguments.
+
+    Returns:
+        Tuple (checkpoint_paths, normalized_weights); the weights sum to 1.
+
+    Raises:
+        FileNotFoundError: If any checkpoint file is missing.
+    """
+    weights = None
+    if args.checkpoints:
+        checkpoint_paths = [Path(p) for p in args.checkpoints]
+        if args.weights:
+            weights = [float(w) for w in args.weights]
+    elif args.ensemble:
+        models_dir = Path(args.models_dir)
+        if ARCH_ALIASES[args.arch] == "lgbm":
+            names = [f"lgbm_fold_{k}.joblib" for k in range(1, N_LOGO_FOLDS + 1)]
+        else:
+            names = [f"{args.arch}_fold_{k}.pt" for k in range(1, N_LOGO_FOLDS + 1)]
+        checkpoint_paths = [models_dir / name for name in names]
+    else:
+        checkpoint_paths = [Path(args.checkpoint)]
+
+    if weights is None:
+        weights = [1.0 / len(checkpoint_paths)] * len(checkpoint_paths)  # equal weighting
+
+    missing = [str(p) for p in checkpoint_paths if not p.is_file()]
+    if missing:
+        raise FileNotFoundError("Missing checkpoint file(s):\n  " + "\n  ".join(missing))
+
+    sum_w = sum(weights)
+    return checkpoint_paths, [w / sum_w for w in weights]
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser."""
     parser = argparse.ArgumentParser(description="Run possession inference on the competition match.")
     parser.add_argument("--checkpoint", type=str, default="models/bi_gru_full.pt",
                         help="Path to single model checkpoint (used if --checkpoints and --ensemble are not set).")
@@ -203,25 +195,67 @@ def main():
     parser.add_argument("--no-abstain", action="store_true",
                         help="Disable selective abstention ('X') and emit only H, A, D.")
     parser.add_argument("--device", type=str, default=None, help="'cuda', 'cpu', or auto-detect.")
+    return parser
+
+
+def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Reject invalid or contradictory CLI values up front with a readable message."""
+    args.arch = args.arch.lower().strip()
+    if args.arch not in ARCH_ALIASES:
+        parser.error(f"--arch '{args.arch}' is not supported; choose one of {sorted(ARCH_ALIASES)}")
+    if args.checkpoints and args.ensemble:
+        parser.error("--checkpoints and --ensemble are mutually exclusive")
+    if args.weights is not None:
+        if not args.checkpoints:
+            parser.error("--weights requires --checkpoints")
+        if len(args.weights) != len(args.checkpoints):
+            parser.error(
+                f"number of --weights ({len(args.weights)}) must match "
+                f"number of --checkpoints ({len(args.checkpoints)})"
+            )
+        if any(not math.isfinite(w) or w < 0.0 for w in args.weights):
+            parser.error("--weights must be finite and non-negative")
+        if sum(args.weights) <= 0.0:
+            parser.error("--weights must sum to a positive value")
+    try:
+        validate_window_args(args.seq_len, args.stride, args.batch_size)
+    except ValueError as error:
+        parser.error(str(error))
+    for flag, value in (("--trans-penalty-ha", args.trans_penalty_ha),
+                        ("--trans-penalty-dead", args.trans_penalty_dead),
+                        ("--dead-ball-boost", args.dead_ball_boost)):
+        if not math.isfinite(value) or value < 0.0:
+            parser.error(f"{flag} must be a finite non-negative number, got {value}")
+    if not 0.0 <= args.abstain_threshold <= 1.0:
+        parser.error(f"--abstain-threshold must lie in [0, 1], got {args.abstain_threshold}")
+
+
+def main() -> None:
+    """Parse CLI arguments, run inference on the competition match and write the submission."""
+    parser = build_arg_parser()
     args = parser.parse_args()
+    validate_args(parser, args)
 
-    if args.device:
-        device = torch.device(args.device)
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}", flush=True)
+    # Fail on missing checkpoints before the (slow) tracking ingestion
+    try:
+        checkpoint_paths, norm_weights = resolve_checkpoints(args)
+    except FileNotFoundError as error:
+        parser.error(str(error))
 
-    if device.type == "cpu":
-        n_threads = min(4, os.cpu_count() or 4)
-        torch.set_num_threads(n_threads)
-        print(f"Configured PyTorch CPU threads: {n_threads}", flush=True)
+    seed_everything(INFERENCE_SEED)
+    try:
+        device = resolve_device(args.device)
+    except ValueError as error:
+        parser.error(str(error))
 
     # 1. Resolve match asset paths
     root_data = args.data_dir or DATA_DIR
     print(f"Loading match assets for {GAME} from: {root_data}")
-    raw_path, meta_path = require(["atd_raw", "atd_meta"], game=GAME, data_dir=root_data)
+    raw_path, meta_path, _ = require(["atd_raw", "atd_meta", "smart_tagging"], game=GAME, data_dir=root_data)
     pitch = GAMES[GAME]["pitch"]
     n_expected = GAMES[GAME]["n_video_frames"]
+    fps = GAMES[GAME]["fps"]
+    cfg = PipelineConfig()
 
     # 2. Ingest tracking data & reconstruct ball trajectory
     print(f"Ingesting raw ATD tracking ({n_expected} frames)...")
@@ -233,24 +267,20 @@ def main():
     )
 
     print("Reconstructing ball trajectory and identifying occlusion blackouts...")
-    ball_res = reconstruct_ball_trajectory(tracking_data.ball_xy, pitch=pitch)
+    ball_res = reconstruct_ball_trajectory(
+        tracking_data.ball_xy,
+        pitch=pitch,
+        max_gap_frames=cfg.max_ball_gap_frames,
+        max_physical_speed_mps=cfg.max_ball_speed_mps,
+        fps=fps,
+        savgol_window=cfg.savgol_window,
+        savgol_polyorder=cfg.savgol_polyorder,
+    )
 
     # 3. Ingest Smart Tagging stoppages
     print("Ingesting Smart Tagging stoppage events...")
     smart_events = load_smart_tagging_events(game=GAME, data_dir=root_data)
-    is_stoppage_tag = np.zeros(n_expected, dtype=np.float32)
-    for ev in smart_events:
-        code = (ev.get("code") or "").strip().lower()
-        sf = max(0, ev.get("start_frame", 0))
-        ef = min(n_expected, ev.get("end_frame", 0))
-        if sf >= ef:
-            continue
-        if code in STOPPAGE_CODES:
-            is_stoppage_tag[sf:ef] = 1.0
-        elif "set piece" in code:
-            etype = (ev.get("tags", {}).get("Type") or "").strip().lower()
-            if not etype or any(t in etype for t in STOPPAGE_SET_PIECE_TYPES):
-                is_stoppage_tag[sf:ef] = 1.0
+    is_stoppage_tag = build_stoppage_tag_mask(smart_events, n_expected).astype(np.float32)
 
     # 4. Extract canonical 14-dimensional features
     print("Extracting canonical 14-dimensional feature representations...")
@@ -261,49 +291,7 @@ def main():
     )
     print(f"Extracted feature matrix shape: {features.shape} (dtype: {features.dtype})")
 
-    # 5. Resolve checkpoint list & weights (Heterogeneous Ensemble)
-    if args.checkpoints:
-        checkpoint_paths = [Path(p) for p in args.checkpoints]
-        if args.weights:
-            if len(args.weights) != len(checkpoint_paths):
-                raise ValueError(
-                    f"Number of --weights ({len(args.weights)}) must match "
-                    f"number of --checkpoints ({len(checkpoint_paths)})"
-                )
-            weights = [float(w) for w in args.weights]
-        else:
-            weights = [1.0 / len(checkpoint_paths)] * len(checkpoint_paths)
-    elif args.ensemble:
-        models_dir = Path(args.models_dir)
-        if args.arch.lower().strip() in ("lgbm", "lightgbm"):
-            checkpoint_paths = [
-                models_dir / "lgbm_fold_1.joblib",
-                models_dir / "lgbm_fold_2.joblib",
-                models_dir / "lgbm_fold_3.joblib",
-            ]
-        else:
-            checkpoint_paths = [
-                models_dir / f"{args.arch}_fold_1.pt",
-                models_dir / f"{args.arch}_fold_2.pt",
-                models_dir / f"{args.arch}_fold_3.pt",
-            ]
-        weights = [1.0 / len(checkpoint_paths)] * len(checkpoint_paths)
-    else:
-        ckpt_path = Path(args.checkpoint)
-        checkpoint_paths = [ckpt_path]
-        weights = [1.0]
-
-    # Verify all checkpoint files exist
-    for p in checkpoint_paths:
-        if not p.is_file():
-            raise FileNotFoundError(f"Missing checkpoint file: {p}")
-
-    # Normalize weights
-    sum_w = sum(weights)
-    if sum_w <= 0:
-        raise ValueError("Ensemble weights must sum to a positive value.")
-    norm_weights = [w / sum_w for w in weights]
-
+    # 5. Load checkpoints (heterogeneous ensemble)
     print(f"\nLoading {len(checkpoint_paths)} checkpoint(s):")
     models = []
     for p, w in zip(checkpoint_paths, norm_weights):
@@ -316,8 +304,6 @@ def main():
     is_dead_ball = None
     if args.hybrid_dead_ball:
         print("\nDetecting physical Dead Ball ('D') intervals via Smart Tagging and player kinematics...")
-        cfg = PipelineConfig()
-        fps = GAMES[GAME]["fps"]
         dead_ball_result = detect_dead_ball(
             n_frames=n_expected,
             mean_player_speed=tracking_data.mean_player_speed,
@@ -343,13 +329,20 @@ def main():
         n_dead_phys = int(np.sum(is_dead_ball))
         print(f"Physical dead-ball detector flagged {n_dead_phys}/{n_expected} frames ({100.0 * n_dead_phys / n_expected:.1f}%).")
 
-    # 7. Independent half-by-half decoding
-    final_codes = np.full(n_expected, 2, dtype=np.int8)  # default Dead Ball (D = 2)
+    # 7. Independent half-by-half decoding; everything outside the halves stays Dead Ball
+    final_codes = np.full(n_expected, DEAD_BALL_CODE, dtype=np.int8)
 
-    for half_num, h_start, h_end in half_blocks:
-        print(f"\nProcessing Half {half_num} (frames {h_start}..{h_end}, span: {h_end - h_start + 1})...")
-        h_features = features[h_start : h_end + 1]
-        h_ball_vis = ~ball_res.is_ball_uncertain[h_start : h_end + 1]
+    for half_num, first_frame, last_frame in half_blocks:
+        h_start = max(0, first_frame)
+        h_stop = min(n_expected, last_frame + 1)  # exclusive
+        if h_start >= h_stop:
+            continue
+        half = slice(h_start, h_stop)
+
+        print(f"\nProcessing Half {half_num} (frames {h_start}..{h_stop - 1}, span: {h_stop - h_start})...")
+        h_features = features[half]
+        # Same visibility the models were fed (feature 3), so abstention matches their input
+        h_ball_vis = h_features[:, BALL_VISIBLE_INDEX] > 0.5
 
         # Predict weighted average probabilities across all models
         h_probs = predict_half_probabilities(
@@ -362,34 +355,26 @@ def main():
             batch_size=args.batch_size,
         )
 
-        # Convert back to log-probabilities
-        h_emissions = np.log(np.clip(h_probs, 1e-7, 1.0)).astype(np.float32)
-
-        # Physics + ML Hybrid Dead-Ball Fusion
-        if args.hybrid_dead_ball and is_dead_ball is not None:
-            h_is_dead = is_dead_ball[h_start : h_end + 1]
-            h_emissions[h_is_dead, 2] += args.dead_ball_boost
-            h_emissions[~h_is_dead, 2] -= 0.5 * args.dead_ball_boost
+        # Back to (finite) log-scores, with optional Physics + ML Hybrid Dead-Ball Fusion
+        h_emissions = fuse_dead_ball_evidence(
+            h_probs,
+            is_dead=is_dead_ball[half] if is_dead_ball is not None else None,
+            dead_ball_boost=args.dead_ball_boost,
+        )
 
         # Decode via Viterbi
-        decoded_half = viterbi_decode(
+        final_codes[half] = viterbi_decode(
             emissions=h_emissions,
             is_ball_visible=h_ball_vis,
             trans_penalty_ha=args.trans_penalty_ha,
             trans_penalty_dead=args.trans_penalty_dead,
             abstain_threshold=args.abstain_threshold,
             enable_abstention=not args.no_abstain,
+            emission_type="logits",
         )
 
-        final_codes[h_start : h_end + 1] = decoded_half
-
-    # Ensure all frames outside official halves are Dead Ball (D = 2)
-    in_half = np.zeros(n_expected, dtype=bool)
-    for _, s, e in half_blocks:
-        in_half[s : e + 1] = True
-    final_codes[~in_half] = 2
-
     # 8. Convert codes to string labels and validate submission contract
+    # codes_to_labels raises on any code outside {0, 1, 2, 3}, so no blank/invalid label can be written
     label_strings = codes_to_labels(final_codes)
     df_submission = pd.DataFrame({
         "frame": np.arange(n_expected, dtype=np.int64),
@@ -403,7 +388,6 @@ def main():
     print("Format validation PASSED!")
 
     # 9. Football analytics summary
-    fps = GAMES[GAME]["fps"]
     n_spells, mean_dur = describe(final_codes, fps)
     print(f"\nSubmission claims {n_spells} possessions with mean duration {mean_dur:.1f} s")
     print("Label distribution:")

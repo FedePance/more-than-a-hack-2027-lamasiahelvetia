@@ -17,14 +17,10 @@ Workflow:
 """
 
 import argparse
-import os
-import random
 import sys
 from pathlib import Path
 
 import numpy as np
-import torch
-from torch import nn
 
 # Add project root and evaluation directory to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -35,11 +31,17 @@ import possession_metrics as pm
 
 from src.ml_pipeline.dataset_open import (
     OpenGameData,
-    generate_ball_dropout_mask,
+    load_cached_game,
     load_open_game_data,
+    prepare_masked_game_features,
 )
-from src.ml_pipeline.features import N_FEATURES
-from src.ml_pipeline.models import build_model
+from src.ml_pipeline.inference import (
+    load_model_from_checkpoint,
+    predict_sliding_window_probabilities,
+    resolve_device,
+    seed_everything,
+    validate_window_args,
+)
 from src.ml_pipeline.viterbi import viterbi_decode
 
 CANDIDATE_WEIGHTS = [
@@ -51,15 +53,8 @@ CANDIDATE_WEIGHTS = [
     (0.2, 0.8),
     (0.0, 1.0),
 ]
-
-
-def seed_everything(seed: int = 42) -> None:
-    """Set random seed across all libraries for deterministic execution."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+FOLD_IDS = (1, 2, 3)
+VAL_DROPOUT_RATIO = 0.41
 
 
 def load_game(
@@ -67,192 +62,16 @@ def load_game(
     cache_dir: Path | str,
     data_dir: Path | str | None = None,
 ) -> OpenGameData:
-    """Load OpenGameData container for Sample_Game_{game_id}, checking cache first."""
-    c_dir = Path(cache_dir)
+    """Load OpenGameData container for Sample_Game_{game_id}, checking cache_dir first."""
     game_str = f"Sample_Game_{game_id}"
-    cache_file = c_dir / f"{game_str}.npz"
-    if cache_file.is_file():
-        try:
-            cached = np.load(cache_file, allow_pickle=False)
-            return OpenGameData(
-                game_id=game_str,
-                n_frames=int(cached["n_frames"]),
-                fps=float(cached["fps"]),
-                pitch=tuple(float(x) for x in cached["pitch"]),
-                ball_xy=cached["ball_xy"],
-                ball_speed=cached["ball_speed"],
-                is_ball_visible=cached["is_ball_visible"],
-                home_player_xy=cached["home_player_xy"],
-                home_player_speed=cached["home_player_speed"],
-                away_player_xy=cached["away_player_xy"],
-                away_player_speed=cached["away_player_speed"],
-                outfield_mean_speed=cached["outfield_mean_speed"],
-                outfield_p80_speed=cached["outfield_p80_speed"],
-                home_centroid_x_norm=cached["home_centroid_x_norm"],
-                away_centroid_x_norm=cached["away_centroid_x_norm"],
-                is_stoppage_tag=cached["is_stoppage_tag"],
-                gt_labels=cached["gt_labels"],
-                features=cached["features"],
-            )
-        except Exception:
-            pass  # Fall back to raw loading
-
+    cached_game = load_cached_game(Path(cache_dir) / f"{game_str}.npz", game_str)
+    if cached_game is not None:
+        return cached_game
     return load_open_game_data(game_id, data_dir=data_dir)
 
 
-def load_checkpoint(
-    checkpoint_path: Path | str,
-    device: torch.device,
-    expected_arch: str,
-) -> nn.Module:
-    """Load model architecture and weights from saved checkpoint file (.pt).
-
-    Args:
-        checkpoint_path: Path to checkpoint .pt file.
-        device: Torch execution device.
-        expected_arch: Expected architecture name ('bi_gru' or 'tcn_1d').
-
-    Returns:
-        Evaluatable nn.Module loaded on device.
-    """
-    p = Path(checkpoint_path)
-    if not p.is_file():
-        raise FileNotFoundError(
-            f"Checkpoint file not found: {p}\n"
-            f"Please verify model training completed via:\n"
-            f"  python src/ml_pipeline/train_logo.py --arch {expected_arch}"
-        )
-
-    ckpt = torch.load(p, map_location=device)
-    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        state_dict = ckpt["model_state_dict"]
-        arch = ckpt.get("arch", expected_arch)
-        hidden_size = ckpt.get("hidden_size", 96)
-        num_layers = ckpt.get("num_layers", 2)
-        dropout = ckpt.get("dropout", 0.25)
-        input_dim = ckpt.get("input_dim", N_FEATURES)
-        num_classes = ckpt.get("num_classes", 3)
-    elif isinstance(ckpt, dict):
-        state_dict = ckpt
-        arch = expected_arch
-        hidden_size = 96
-        num_layers = 2
-        dropout = 0.25
-        input_dim = N_FEATURES
-        num_classes = 3
-    else:
-        raise ValueError(f"Unrecognized checkpoint format in {p}")
-
-    model = build_model(
-        arch=arch,
-        input_dim=input_dim,
-        hidden_size=hidden_size,
-        num_layers=num_layers,
-        dropout=dropout,
-        num_classes=num_classes,
-    )
-    model = model.to(device)
-    model.load_state_dict(state_dict)
-    model.eval()
-    return model
-
-
-def prepare_masked_game_features(
-    game: OpenGameData,
-    target_ratio: float = 0.41,
-    seed: int = 42,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Apply deterministic 41% ball dropout mask and reset ball feature channels.
-
-    Args:
-        game: OpenGameData match container.
-        target_ratio: Target occlusion fraction (0.41).
-        seed: Deterministic random seed for dropout mask.
-
-    Returns:
-        Tuple of (val_features, ball_vis) where:
-        - val_features: (n_frames, 14) feature array with masked ball channels.
-        - ball_vis: (n_frames,) boolean mask indicating effective ball visibility.
-    """
-    n_frames = game.n_frames
-    val_dropout_mask = generate_ball_dropout_mask(n_frames, target_ratio=target_ratio, seed=seed)
-    ball_vis = game.is_ball_visible.copy() & ~val_dropout_mask
-
-    val_features = game.features.copy()
-    masked = ~ball_vis
-    val_features[masked, 0] = 50.0  # min_dist_home
-    val_features[masked, 1] = 50.0  # min_dist_away
-    val_features[masked, 2] = 0.0   # dist_diff
-    val_features[masked, 3] = 0.0   # is_ball_visible
-    val_features[masked, 4] = 0.0   # ball_speed
-    val_features[masked, 5] = 0.0   # ball_x_norm
-    val_features[masked, 6] = 0.0   # ball_y_norm
-    val_features[masked, 7] = 0.0   # closest_home_speed
-    val_features[masked, 8] = 0.0   # closest_away_speed
-
-    return val_features, ball_vis
-
-
-def predict_model_probabilities(
-    model: nn.Module,
-    features: np.ndarray,
-    device: torch.device,
-    seq_len: int = 250,
-    stride: int = 125,
-    batch_size: int = 64,
-) -> np.ndarray:
-    """Run model inference across full match frames using overlapping window averaging.
-
-    Args:
-        model: Trained PyTorch sequence model in eval mode.
-        features: Frame features array of shape (n_frames, n_features).
-        device: Torch execution device.
-        seq_len: Slicing sequence length in frames.
-        stride: Slicing step in frames.
-        batch_size: Window batch size.
-
-    Returns:
-        Per-frame softmax probabilities of shape (n_frames, 3).
-    """
-    model.eval()
-    n_frames = len(features)
-    accum_logits = np.zeros((n_frames, 3), dtype=np.float32)
-    counts = np.zeros(n_frames, dtype=np.float32)
-
-    windows = []
-    spans = []
-    max_start = n_frames - seq_len
-    starts = list(range(0, max_start + 1, stride))
-    if not starts or starts[-1] < max_start:
-        starts.append(max_start)
-
-    for start in starts:
-        end = start + seq_len
-        windows.append(features[start:end])
-        spans.append((start, end))
-
-    with torch.no_grad():
-        for b_start in range(0, len(windows), batch_size):
-            b_end = min(len(windows), b_start + batch_size)
-            batch_data = np.stack(windows[b_start:b_end], axis=0)
-            tensor_x = torch.from_numpy(batch_data).float().to(device)
-            batch_logits = model(tensor_x).cpu().numpy()
-
-            for i, (s, e) in enumerate(spans[b_start:b_end]):
-                accum_logits[s:e] += batch_logits[i]
-                counts[s:e] += 1.0
-
-    counts = np.maximum(counts, 1.0)[:, None]
-    avg_logits = accum_logits / counts
-
-    # Numerically stable softmax probabilities
-    shift = avg_logits - np.max(avg_logits, axis=-1, keepdims=True)
-    exp_vals = np.exp(shift)
-    probs = (exp_vals / np.sum(exp_vals, axis=-1, keepdims=True)).astype(np.float32)
-    return probs
-
-
-def main():
+def main() -> None:
+    """Parse CLI arguments and evaluate the BiGRU / TCN-1D blending weight grid."""
     parser = argparse.ArgumentParser(
         description="Tune external LOGO ensemble blending weights between BiGRU and TCN-1D."
     )
@@ -302,21 +121,35 @@ def main():
     )
     args = parser.parse_args()
 
-    seed_everything(args.seed)
-
-    if args.device:
-        device = torch.device(args.device)
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}", flush=True)
-
-    if device.type == "cpu":
-        n_threads = min(4, os.cpu_count() or 4)
-        torch.set_num_threads(n_threads)
-        print(f"Configured PyTorch CPU threads: {n_threads}", flush=True)
+    try:
+        validate_window_args(args.window_size, args.stride, args.batch_size)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.trans_penalty_ha < 0 or args.trans_penalty_dead < 0:
+        parser.error("--trans-penalty-ha and --trans-penalty-dead must be >= 0")
+    if not 0.0 <= args.abstain_threshold <= 1.0:
+        parser.error("--abstain-threshold must lie in [0, 1]")
 
     models_dir = Path(args.models_dir)
     cache_dir = Path(args.cache_dir)
+
+    # Fail before any heavy work if a fold checkpoint is missing
+    fold_checkpoints = {
+        k: {"bi_gru": models_dir / f"bi_gru_fold_{k}.pt", "tcn_1d": models_dir / f"tcn_1d_fold_{k}.pt"}
+        for k in FOLD_IDS
+    }
+    missing = [str(p) for ckpts in fold_checkpoints.values() for p in ckpts.values() if not p.is_file()]
+    if missing:
+        parser.error(
+            "missing fold checkpoint(s):\n  " + "\n  ".join(missing)
+            + "\nTrain them with: python src/ml_pipeline/train_logo.py --mode logo --arch {bi_gru,tcn_1d}"
+        )
+
+    seed_everything(args.seed)
+    try:
+        device = resolve_device(args.device)
+    except ValueError as error:
+        parser.error(str(error))
 
     print(f"\n{'='*90}", flush=True)
     print("STEP 1: INGESTING HELD-OUT VALIDATION GAMES & PRECOMPUTING MODEL PROBABILITIES", flush=True)
@@ -324,7 +157,7 @@ def main():
 
     fold_data = {}
 
-    for k in [1, 2, 3]:
+    for k in FOLD_IDS:
         game_id_str = f"Sample_Game_{k}"
         print(f"\n--- Fold {k}: Held-out Validation Game {game_id_str} ---", flush=True)
 
@@ -337,7 +170,9 @@ def main():
         )
 
         # 2. Mask features under 41% deterministic synthetic dropout
-        val_features, ball_vis = prepare_masked_game_features(game, target_ratio=0.41, seed=args.seed)
+        val_features, ball_vis = prepare_masked_game_features(
+            game, target_ratio=VAL_DROPOUT_RATIO, seed=args.seed
+        )
         n_masked = int((~ball_vis).sum())
         print(
             f"Applied 41% synthetic ball blackout: {n_masked}/{game.n_frames} frames occluded "
@@ -345,40 +180,28 @@ def main():
             flush=True,
         )
 
-        # 3. Load BiGRU fold checkpoint and predict probabilities
-        bigru_ckpt = models_dir / f"bi_gru_fold_{k}.pt"
-        print(f"Loading BiGRU fold checkpoint: {bigru_ckpt}...", flush=True)
-        bigru_model = load_checkpoint(bigru_ckpt, device, expected_arch="bi_gru")
-        probs_bigru = predict_model_probabilities(
-            model=bigru_model,
-            features=val_features,
-            device=device,
-            seq_len=args.window_size,
-            stride=args.stride,
-            batch_size=args.batch_size,
-        )
-        print(f"BiGRU probability matrix computed: shape {probs_bigru.shape}", flush=True)
-
-        # 4. Load TCN-1D fold checkpoint and predict probabilities
-        tcn_ckpt = models_dir / f"tcn_1d_fold_{k}.pt"
-        print(f"Loading TCN-1D fold checkpoint: {tcn_ckpt}...", flush=True)
-        tcn_model = load_checkpoint(tcn_ckpt, device, expected_arch="tcn_1d")
-        probs_tcn = predict_model_probabilities(
-            model=tcn_model,
-            features=val_features,
-            device=device,
-            seq_len=args.window_size,
-            stride=args.stride,
-            batch_size=args.batch_size,
-        )
-        print(f"TCN-1D probability matrix computed: shape {probs_tcn.shape}", flush=True)
+        # 3. Load each fold checkpoint and predict per-frame probabilities
+        fold_probs = {}
+        for arch, display_name in (("bi_gru", "BiGRU"), ("tcn_1d", "TCN-1D")):
+            ckpt_path = fold_checkpoints[k][arch]
+            print(f"Loading {display_name} fold checkpoint: {ckpt_path}...", flush=True)
+            model = load_model_from_checkpoint(ckpt_path, device, default_arch=arch)
+            fold_probs[arch] = predict_sliding_window_probabilities(
+                model=model,
+                features=val_features,
+                device=device,
+                seq_len=args.window_size,
+                stride=args.stride,
+                batch_size=args.batch_size,
+            )
+            print(f"{display_name} probability matrix computed: shape {fold_probs[arch].shape}", flush=True)
 
         fold_data[k] = {
             "game_id": game_id_str,
             "gt_labels": game.gt_labels,
             "ball_vis": ball_vis,
-            "probs_bigru": probs_bigru,
-            "probs_tcn": probs_tcn,
+            "probs_bigru": fold_probs["bi_gru"],
+            "probs_tcn": fold_probs["tcn_1d"],
         }
 
     print(f"\n{'='*90}", flush=True)
@@ -391,7 +214,7 @@ def main():
         fold_spell_f1s = []
         fold_macro_f1s = []
 
-        for k in [1, 2, 3]:
+        for k in FOLD_IDS:
             fd = fold_data[k]
             # Convex blend of softmax probabilities
             blended_probs = w_bigru * fd["probs_bigru"] + w_tcn * fd["probs_tcn"]
@@ -404,6 +227,7 @@ def main():
                 trans_penalty_dead=args.trans_penalty_dead,
                 abstain_threshold=args.abstain_threshold,
                 enable_abstention=True,
+                emission_type="probs",
             )
 
             # Official competition possession metrics evaluation

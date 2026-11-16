@@ -9,6 +9,18 @@ from src.ml_pipeline.models.tcn_1d import PossessionTCN1D
 
 SUPPORTED_ARCHITECTURES = ["bi_gru", "tcn_1d", "lgbm"]
 
+# Accepted spellings (lower case) -> canonical architecture name
+ARCH_ALIASES = {
+    "bi_gru": "bi_gru",
+    "bigru": "bi_gru",
+    "gru": "bi_gru",
+    "tcn_1d": "tcn_1d",
+    "tcn1d": "tcn_1d",
+    "tcn": "tcn_1d",
+    "lgbm": "lgbm",
+    "lightgbm": "lgbm",
+}
+
 
 def build_model(
     arch: str,
@@ -19,20 +31,23 @@ def build_model(
     """Build and instantiate a sequence or tabular model architecture.
 
     Args:
-        arch: Architecture name ('bi_gru', 'tcn_1d', 'lgbm', etc.).
+        arch: Architecture name or alias ('bi_gru', 'tcn_1d', 'lgbm', etc.).
         input_dim: Number of input features (default: 14).
         num_classes: Target classes (default: 3: H, A, D).
         **kwargs: Additional model parameters (e.g. hidden_size, num_layers, dropout).
 
     Returns:
         Instantiated nn.Module or PossessionLGBM.
+
+    Raises:
+        ValueError: If the architecture name is not recognized.
     """
-    clean_arch = arch.lower().strip()
-    if clean_arch in ("bi_gru", "bigru", "gru"):
+    canonical_arch = ARCH_ALIASES.get(str(arch).lower().strip())
+    if canonical_arch == "bi_gru":
         return PossessionBiGRU(input_dim=input_dim, num_classes=num_classes, **kwargs)
-    if clean_arch in ("tcn_1d", "tcn1d", "tcn"):
+    if canonical_arch == "tcn_1d":
         return PossessionTCN1D(input_dim=input_dim, num_classes=num_classes, **kwargs)
-    if clean_arch in ("lgbm", "lightgbm"):
+    if canonical_arch == "lgbm":
         return PossessionLGBM(**kwargs)
     raise ValueError(
         f"Unsupported architecture '{arch}'. Available options: {SUPPORTED_ARCHITECTURES}"
@@ -40,6 +55,7 @@ def build_model(
 
 
 __all__ = [
+    "ARCH_ALIASES",
     "SUPPORTED_ARCHITECTURES",
     "PossessionBiGRU",
     "PossessionTCN1D",

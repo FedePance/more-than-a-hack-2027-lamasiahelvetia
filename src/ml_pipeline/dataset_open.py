@@ -9,8 +9,11 @@ and implements on-the-fly domain augmentations directly on precomputed slices:
 """
 
 import json
-from dataclasses import dataclass
+import warnings
+import zipfile
+from dataclasses import dataclass, fields
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -18,8 +21,17 @@ import torch
 from torch.utils.data import Dataset
 
 from src.ml_pipeline.features import (
+    BALL_VISIBLE_INDEX,
     extract_frame_features,
+    mask_ball_features,
 )
+
+# Half pitch dimensions (m) used to express metric jitter in normalized ball coordinates
+_HALF_PITCH_LENGTH_M = 52.65
+_HALF_PITCH_WIDTH_M = 34.0
+_BALL_SPEED_JITTER_SIGMA = 0.2
+_DROPOUT_MIN_SPAN = 5
+_DROPOUT_MAX_SPAN = 75
 
 
 @dataclass
@@ -46,16 +58,24 @@ class OpenGameData:
     features: np.ndarray  # (n_frames, 14), float32 precomputed base feature matrix
 
 
+# Per-frame array fields persisted in the .npz cache (everything except the scalar metadata)
+_CACHED_ARRAY_FIELDS = tuple(
+    f.name for f in fields(OpenGameData) if f.name not in ("game_id", "n_frames", "fps", "pitch")
+)
+
+
 def locate_open_data_dir(data_dir: str | Path | None = None) -> Path:
     """Find the root directory containing Metrica Sample Games."""
     candidates = []
     if data_dir is not None:
         candidates.append(Path(data_dir))
+    project_root = Path(__file__).resolve().parents[2]
     candidates.extend([
         Path("external_open/data"),
         Path("external_open/sample-data-master/data"),
         Path("../external_open/data"),
-        Path("/workspaces/barca-hackathon/external_open/data"),
+        project_root / "external_open" / "data",
+        project_root / "external_open" / "sample-data-master" / "data",
     ])
     for p in candidates:
         if p.is_dir() and (p / "Sample_Game_1").is_dir():
@@ -102,6 +122,75 @@ def generate_ball_dropout_mask(
         current_dropped += new_dropped
 
     return mask
+
+
+def apply_domain_augmentations(
+    feat: np.ndarray,
+    labels: np.ndarray,
+    drop_mask: np.ndarray,
+    rng: Any,
+    jitter_sigma: float = 0.25,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply the competition-domain augmentations to one feature sequence.
+
+    1. Ball occlusion dropout on drop_mask, plus tracking jitter on the frames left visible.
+    2. Random Home <-> Away swap (p = 0.5) with label transposition.
+    3. Pitch coordinate reflection (p = 0.5 on each axis).
+
+    Args:
+        feat: Feature matrix of shape (n, 14), modified in place.
+        labels: Integer labels of shape (n,) (0=H, 1=A, 2=D); not modified.
+        drop_mask: Boolean mask of shape (n,), True where the ball is synthetically occluded.
+        rng: Random source exposing normal() and rand(): a np.random.RandomState, or the
+            np.random module itself for the globally seeded stream.
+        jitter_sigma: Coordinate noise standard deviation in metres.
+
+    Returns:
+        Tuple (feat, labels) with the augmented features and (possibly swapped) labels.
+    """
+    masked = drop_mask | (feat[:, BALL_VISIBLE_INDEX] < 0.5)
+    mask_ball_features(feat, masked)
+
+    # On frames where ball remains visible, add jitter
+    vis = ~masked
+    n_vis = int(vis.sum())
+    if n_vis > 0:
+        jitter_h = rng.normal(0.0, jitter_sigma, size=n_vis).astype(np.float32)
+        jitter_a = rng.normal(0.0, jitter_sigma, size=n_vis).astype(np.float32)
+        feat[vis, 0] = np.maximum(0.1, feat[vis, 0] + jitter_h)
+        feat[vis, 1] = np.maximum(0.1, feat[vis, 1] + jitter_a)
+        feat[vis, 2] = feat[vis, 1] - feat[vis, 0]
+
+        # Ball normalized coordinates jitter
+        jx_norm = rng.normal(0.0, jitter_sigma / _HALF_PITCH_LENGTH_M, size=n_vis).astype(np.float32)
+        jy_norm = rng.normal(0.0, jitter_sigma / _HALF_PITCH_WIDTH_M, size=n_vis).astype(np.float32)
+        feat[vis, 5] = np.clip(feat[vis, 5] + jx_norm, -1.0, 1.0)
+        feat[vis, 6] = np.clip(feat[vis, 6] + jy_norm, -1.0, 1.0)
+
+        # Ball speed light jitter
+        spd_j = rng.normal(0.0, _BALL_SPEED_JITTER_SIGMA, size=n_vis).astype(np.float32)
+        feat[vis, 4] = np.maximum(0.0, feat[vis, 4] + spd_j)
+
+    # Random Home <-> Away swap: distances (0, 1), closest speeds (7, 8), centroids (11, 12),
+    # negated dist_diff (2), and labels 0 <-> 1 (2 = D unchanged)
+    if rng.rand() < 0.5:
+        feat[:, [0, 1, 7, 8, 11, 12]] = feat[:, [1, 0, 8, 7, 12, 11]]
+        feat[:, 2] = -feat[:, 2]
+
+        swapped = labels.copy()
+        swapped[labels == 0] = 1
+        swapped[labels == 1] = 0
+        labels = swapped
+
+    # Mirror X: ball_x_norm (5), home_centroid_x_norm (11), away_centroid_x_norm (12)
+    if rng.rand() < 0.5:
+        feat[:, [5, 11, 12]] = -feat[:, [5, 11, 12]]
+
+    # Mirror Y: ball_y_norm (6)
+    if rng.rand() < 0.5:
+        feat[:, 6] = -feat[:, 6]
+
+    return feat, labels
 
 
 def _compute_central_diff_speed(
@@ -211,6 +300,52 @@ def _build_gt_labels_and_stoppages(
     return gt_labels, is_stoppage
 
 
+def load_cached_game(cache_file: str | Path, game_id: str) -> "OpenGameData | None":
+    """Load a parsed game from its .npz cache, or None if the cache is missing or unusable."""
+    cache_path = Path(cache_file)
+    if not cache_path.is_file():
+        return None
+    try:
+        with np.load(cache_path, allow_pickle=False) as cached:
+            return OpenGameData(
+                game_id=game_id,
+                n_frames=int(cached["n_frames"]),
+                fps=float(cached["fps"]),
+                pitch=tuple(float(x) for x in cached["pitch"]),
+                **{name: cached[name] for name in _CACHED_ARRAY_FIELDS},
+            )
+    except (OSError, KeyError, ValueError, EOFError, zipfile.BadZipFile):
+        return None  # corrupted or outdated cache: caller falls back to raw parsing
+
+
+def prepare_masked_game_features(
+    game: "OpenGameData",
+    target_ratio: float = 0.41,
+    seed: int = 42,
+    apply_synthetic_dropout: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build validation features under a deterministic synthetic ball blackout.
+
+    Args:
+        game: OpenGameData match container.
+        target_ratio: Target occlusion fraction (default: 0.41).
+        seed: Deterministic random seed for the dropout mask.
+        apply_synthetic_dropout: Whether to add the synthetic blackout on top of the
+            frames where the ball is genuinely missing.
+
+    Returns:
+        Tuple of (val_features, ball_vis) where:
+        - val_features: (n_frames, 14) feature copy with ball channels reset on occluded frames.
+        - ball_vis: (n_frames,) boolean mask indicating effective ball visibility.
+    """
+    ball_vis = np.array(game.is_ball_visible, dtype=bool)
+    if apply_synthetic_dropout:
+        ball_vis &= ~generate_ball_dropout_mask(game.n_frames, target_ratio=target_ratio, seed=seed)
+
+    val_features = mask_ball_features(game.features.copy(), ~ball_vis)
+    return val_features, ball_vis
+
+
 def load_open_game_data(
     game_id_or_name: str | int,
     data_dir: str | Path | None = None,
@@ -255,31 +390,10 @@ def load_open_game_data(
     cache_dir = root_dir.parent / ".cache"
     cache_file = cache_dir / f"{game_str}.npz"
 
-    if use_cache and cache_file.is_file():
-        try:
-            cached = np.load(cache_file, allow_pickle=False)
-            return OpenGameData(
-                game_id=game_str,
-                n_frames=int(cached["n_frames"]),
-                fps=float(cached["fps"]),
-                pitch=tuple(float(x) for x in cached["pitch"]),
-                ball_xy=cached["ball_xy"],
-                ball_speed=cached["ball_speed"],
-                is_ball_visible=cached["is_ball_visible"],
-                home_player_xy=cached["home_player_xy"],
-                home_player_speed=cached["home_player_speed"],
-                away_player_xy=cached["away_player_xy"],
-                away_player_speed=cached["away_player_speed"],
-                outfield_mean_speed=cached["outfield_mean_speed"],
-                outfield_p80_speed=cached["outfield_p80_speed"],
-                home_centroid_x_norm=cached["home_centroid_x_norm"],
-                away_centroid_x_norm=cached["away_centroid_x_norm"],
-                is_stoppage_tag=cached["is_stoppage_tag"],
-                gt_labels=cached["gt_labels"],
-                features=cached["features"],
-            )
-        except (OSError, KeyError, ValueError):
-            pass  # Fall through to raw parsing if cache corrupted
+    if use_cache:
+        cached_game = load_cached_game(cache_file, game_str)
+        if cached_game is not None:
+            return cached_game
 
     if not is_epts:
         # Load Metrica CSV Tracking Data (Games 1 and 2)
@@ -416,13 +530,15 @@ def load_open_game_data(
 
     # Compute collective outfield speeds
     comb_speeds = np.concatenate([home_player_speed, away_player_speed], axis=1)
-    with np.errstate(invalid="ignore"):
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)  # frames with no tracked player
         outfield_mean_speed = np.nan_to_num(np.nanmean(comb_speeds, axis=1), nan=0.0).astype(np.float32)
         outfield_p80_speed = np.nan_to_num(np.nanpercentile(comb_speeds, 80, axis=1), nan=0.0).astype(np.float32)
 
     # Compute team longitudinal centroids
     half_len = pitch_len / 2.0
-    with np.errstate(invalid="ignore"):
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)  # frames with no tracked player
         h_cx = (np.nanmean(home_xy[:, :, 0], axis=1) - half_len) / half_len
         a_cx = (np.nanmean(away_xy[:, :, 0], axis=1) - half_len) / half_len
     home_centroid_x_norm = np.clip(np.nan_to_num(h_cx, nan=0.0), -1.0, 1.0).astype(np.float32)
@@ -448,34 +564,7 @@ def load_open_game_data(
         away_centroid_x_norm=away_centroid_x_norm,
     )
 
-    # Cache precomputed arrays to .npz for fast future loads
-    if use_cache:
-        try:
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(
-                cache_file,
-                n_frames=n_frames,
-                fps=fps,
-                pitch=np.array(pitch, dtype=np.float32),
-                ball_xy=ball_xy,
-                ball_speed=ball_speed,
-                is_ball_visible=is_ball_visible,
-                home_player_xy=home_xy,
-                home_player_speed=home_player_speed,
-                away_player_xy=away_xy,
-                away_player_speed=away_player_speed,
-                outfield_mean_speed=outfield_mean_speed,
-                outfield_p80_speed=outfield_p80_speed,
-                home_centroid_x_norm=home_centroid_x_norm,
-                away_centroid_x_norm=away_centroid_x_norm,
-                is_stoppage_tag=is_stoppage_tag,
-                gt_labels=gt_labels,
-                features=features,
-            )
-        except (OSError, ValueError):
-            pass
-
-    return OpenGameData(
+    game = OpenGameData(
         game_id=game_str,
         n_frames=n_frames,
         fps=fps,
@@ -495,6 +584,22 @@ def load_open_game_data(
         gt_labels=gt_labels,
         features=features,
     )
+
+    # Cache precomputed arrays to .npz for fast future loads (best effort)
+    if use_cache:
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                cache_file,
+                n_frames=n_frames,
+                fps=fps,
+                pitch=np.array(pitch, dtype=np.float32),
+                **{name: getattr(game, name) for name in _CACHED_ARRAY_FIELDS},
+            )
+        except (OSError, ValueError):
+            pass
+
+    return game
 
 
 class OpenGameDataset(Dataset):
@@ -519,6 +624,9 @@ class OpenGameDataset(Dataset):
             dropout_ratio: Target ball occlusion dropout ratio (default: 0.41).
             coord_jitter_sigma: Coordinate noise standard deviation in metres (default: 0.25 m).
         """
+        if seq_len < 1 or stride < 1:
+            raise ValueError(f"seq_len and stride must be >= 1, got seq_len={seq_len}, stride={stride}")
+
         self.games = games
         self.seq_len = seq_len
         self.stride = stride
@@ -546,84 +654,22 @@ class OpenGameDataset(Dataset):
         labels = game.gt_labels[start:end].copy()
 
         if self.augment:
-            # 1. 41% Ball Occlusion Dropout + Tracking Jitter
-            # Synthetically mask contiguous ball spans
+            # Synthetically mask contiguous ball spans (~41% of the window), drawing from the
+            # globally seeded NumPy stream so runs are reproducible under seed_everything()
             drop_mask = np.zeros(self.seq_len, dtype=bool)
             target_drop = int(self.seq_len * self.dropout_ratio)
             n_dropped = 0
             attempts = 0
             while n_dropped < target_drop and attempts < 10:
                 attempts += 1
-                span_len = np.random.randint(5, 76)
+                span_len = np.random.randint(_DROPOUT_MIN_SPAN, _DROPOUT_MAX_SPAN + 1)
                 s_idx = np.random.randint(0, max(1, self.seq_len - span_len))
                 e_idx = min(self.seq_len, s_idx + span_len)
                 n_dropped += int((~drop_mask[s_idx:e_idx]).sum())
                 drop_mask[s_idx:e_idx] = True
 
-            # Where masked or originally missing: reset ball features to sentinel/zeros
-            masked = drop_mask | (feat[:, 3] < 0.5)
-            feat[masked, 0] = 50.0  # min_dist_home
-            feat[masked, 1] = 50.0  # min_dist_away
-            feat[masked, 2] = 0.0   # dist_diff
-            feat[masked, 3] = 0.0   # is_ball_visible
-            feat[masked, 4] = 0.0   # ball_speed
-            feat[masked, 5] = 0.0   # ball_x_norm
-            feat[masked, 6] = 0.0   # ball_y_norm
-            feat[masked, 7] = 0.0   # closest_home_speed
-            feat[masked, 8] = 0.0   # closest_away_speed
-
-            # On frames where ball remains visible, add jitter
-            vis = ~masked
-            n_vis = int(vis.sum())
-            if n_vis > 0:
-                jitter_h = np.random.normal(0.0, self.jitter_sigma, size=n_vis).astype(np.float32)
-                jitter_a = np.random.normal(0.0, self.jitter_sigma, size=n_vis).astype(np.float32)
-                feat[vis, 0] = np.maximum(0.1, feat[vis, 0] + jitter_h)
-                feat[vis, 1] = np.maximum(0.1, feat[vis, 1] + jitter_a)
-                feat[vis, 2] = feat[vis, 1] - feat[vis, 0]
-
-                # Ball normalized coordinates jitter
-                jx_norm = np.random.normal(0.0, self.jitter_sigma / 52.65, size=n_vis).astype(np.float32)
-                jy_norm = np.random.normal(0.0, self.jitter_sigma / 34.0, size=n_vis).astype(np.float32)
-                feat[vis, 5] = np.clip(feat[vis, 5] + jx_norm, -1.0, 1.0)
-                feat[vis, 6] = np.clip(feat[vis, 6] + jy_norm, -1.0, 1.0)
-
-                # Ball speed light jitter
-                spd_j = np.random.normal(0.0, 0.2, size=n_vis).astype(np.float32)
-                feat[vis, 4] = np.maximum(0.0, feat[vis, 4] + spd_j)
-
-            # 2. Random Home <-> Away Swap (p = 0.5)
-            if np.random.rand() < 0.5:
-                # Swap min_dist_home (0) and min_dist_away (1)
-                tmp0 = feat[:, 0].copy()
-                feat[:, 0] = feat[:, 1]
-                feat[:, 1] = tmp0
-                # Negate dist_diff (2)
-                feat[:, 2] = -feat[:, 2]
-                # Swap closest player speeds (7 and 8)
-                tmp7 = feat[:, 7].copy()
-                feat[:, 7] = feat[:, 8]
-                feat[:, 8] = tmp7
-                # Swap team longitudinal centroids (11 and 12)
-                tmp11 = feat[:, 11].copy()
-                feat[:, 11] = feat[:, 12]
-                feat[:, 12] = tmp11
-
-                # Transpose labels: 0 <-> 1 (leaving 2 unchanged)
-                swapped = labels.copy()
-                swapped[labels == 0] = 1
-                swapped[labels == 1] = 0
-                labels = swapped
-
-            # 3. Pitch Coordinate Reflection (p = 0.5 each axis)
-            if np.random.rand() < 0.5:
-                # Mirror X: ball_x_norm (5), home_centroid_x_norm (11), away_centroid_x_norm (12)
-                feat[:, 5] = -feat[:, 5]
-                feat[:, 11] = -feat[:, 11]
-                feat[:, 12] = -feat[:, 12]
-
-            if np.random.rand() < 0.5:
-                # Mirror Y: ball_y_norm (6)
-                feat[:, 6] = -feat[:, 6]
+            feat, labels = apply_domain_augmentations(
+                feat, labels, drop_mask, rng=np.random, jitter_sigma=self.jitter_sigma
+            )
 
         return torch.from_numpy(feat).float(), torch.from_numpy(labels).long()

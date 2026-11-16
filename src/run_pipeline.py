@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Dict, List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -34,7 +34,6 @@ from games import (
     DEFAULT_SOURCE,
     asset_paths,
     half_video_blocks,
-    require,
     source_frames,
 )
 from starter.load_smart_tagging import load as load_smart_tagging
@@ -42,10 +41,10 @@ from src.config import PipelineConfig
 from src.data_loader import load_raw_tracking_data
 from src.ball_tracking import reconstruct_ball_trajectory
 from src.dead_ball import detect_dead_ball
-from src.possession_engine import run_possession_state_machine
+from src.possession_engine import VALID_LABELS, run_possession_state_machine
 
 
-def resolve_data_directory(cli_data_dir: str = None) -> Path:
+def resolve_data_directory(cli_data_dir: Optional[str] = None) -> Path:
     """Resolve match data directory with precedence: CLI flag > MTAH_DATA_DIR > ./data.
 
     Args:
@@ -138,9 +137,8 @@ def validate_submission_format(df: pd.DataFrame, expected_rows: int) -> None:
         raise ValueError("Submission contains NaN/empty labels; write X to abstain")
 
     labels = set(df["label"].unique())
-    valid_labels = {"H", "A", "D", "X"}
-    if not labels.issubset(valid_labels):
-        raise ValueError(f"Invalid labels found: {labels - valid_labels}")
+    if not labels.issubset(VALID_LABELS):
+        raise ValueError(f"Invalid labels found: {sorted(map(str, labels - VALID_LABELS))}")
 
 
 def run_pipeline(
@@ -148,7 +146,7 @@ def run_pipeline(
     output_path: Path,
     game: str = GAME,
     source: str = DEFAULT_SOURCE,
-    config: PipelineConfig = None,
+    config: Optional[PipelineConfig] = None,
 ) -> pd.DataFrame:
     """Run the complete possession inference pipeline across the match.
 
@@ -258,9 +256,7 @@ def run_pipeline(
         ball_xy=ball_result.ball_xy,
         is_ball_uncertain=ball_result.is_ball_uncertain,
         is_dead_ball=dead_ball_result.is_dead_ball,
-        ball_speed=ball_result.ball_speed,
         player_xy=tracking.player_xy,
-        player_speed=tracking.player_speed,
         team_of_track=tracking.team_of_track,
         team_names=tracking.team_names,
         smart_tagging_events=smart_tagging_events,
@@ -270,11 +266,10 @@ def run_pipeline(
         scramble_abstain_frames=config.scramble_abstain_frames,
         restart_search_frames=config.restart_search_frames,
         min_live_spell_frames=config.min_live_spell_frames,
-        fps=fps,
     )
 
     df_submission = pd.DataFrame({
-        "frame": np.arange(n_frames, dtype=np.int32),
+        "frame": np.arange(n_frames, dtype=np.int64),
         "label": possession_result.labels,
     })
 
@@ -308,7 +303,8 @@ def run_pipeline(
     return df_submission
 
 
-def main():
+def main() -> None:
+    """Parse CLI arguments and run the physics / heuristic possession pipeline."""
     parser = argparse.ArgumentParser(
         description="La MasIA Helvetia - Ball Possession Identification Pipeline (More Than A Hack 2027)"
     )
@@ -328,13 +324,19 @@ def main():
         "--game",
         type=str,
         default=GAME,
+        choices=sorted(GAMES),
         help=f"Match identifier (default: {GAME})",
     )
     parser.add_argument(
         "--source",
         type=str,
         default=DEFAULT_SOURCE,
-        help=f"Camera source (default: {DEFAULT_SOURCE})",
+        choices=[DEFAULT_SOURCE],
+        help=(
+            f"Camera source (default: {DEFAULT_SOURCE}). Submissions are indexed to the "
+            f"{DEFAULT_SOURCE} video, and Smart Tagging and the half boundaries exist only "
+            "on that timeline, so it is the only supported source."
+        ),
     )
 
     args = parser.parse_args()

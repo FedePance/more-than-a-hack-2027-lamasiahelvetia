@@ -17,6 +17,8 @@ from scipy.ndimage import maximum_filter1d, minimum_filter1d, uniform_filter1d
 # 0: min_dist_home, 1: min_dist_away, 2: dist_diff, 4: ball_speed,
 # 7: closest_home_speed, 8: closest_away_speed, 9: outfield_mean_speed, 10: outfield_p80_speed
 KEY_DIST_SPEED_INDICES = [0, 1, 2, 4, 7, 8, 9, 10]
+N_BASE_FEATURES = 14
+N_CLASSES = 3
 TEMPORAL_KERNEL_SIZES = (13, 25, 51, 125)  # ~0.5s, 1.0s, 2.0s, 5.0s at 25 fps
 SHORT_DIFF_LAG = 12  # ~0.48s at 25 fps
 
@@ -39,9 +41,14 @@ def expand_temporal_tabular_features(base_features: np.ndarray) -> np.ndarray:
         Expanded 2D numpy array of shape (n_frames, n_expanded_features), dtype float32.
     """
     base = np.asarray(base_features, dtype=np.float32)
+    if base.ndim != 2:
+        raise ValueError(f"Expected 2D base feature matrix, got shape {base.shape}")
     n_frames, n_feats = base.shape
     if n_frames == 0:
-        return np.zeros((0, 0), dtype=np.float32)
+        # Keep the column count consistent with the non-empty case
+        n_key = len(KEY_DIST_SPEED_INDICES)
+        n_expanded = n_feats + len(TEMPORAL_KERNEL_SIZES) * (2 * n_feats + 2 * n_key) + 2 * n_feats
+        return np.zeros((0, n_expanded), dtype=np.float32)
 
     feature_blocks: list[np.ndarray] = [base]
 
@@ -163,10 +170,13 @@ class PossessionLGBM:
         Returns:
             np.ndarray of shape (n_frames, 3), dtype float32.
         """
+        base_features = np.asarray(base_features)
         if base_features.ndim != 2:
             raise ValueError(f"Expected 2D feature matrix, got shape {base_features.shape}")
+        if len(base_features) == 0:
+            return np.zeros((0, N_CLASSES), dtype=np.float32)
 
-        if base_features.shape[1] == 14:
+        if base_features.shape[1] == N_BASE_FEATURES:
             x_input = expand_temporal_tabular_features(base_features)
         else:
             x_input = base_features
@@ -174,14 +184,15 @@ class PossessionLGBM:
         raw_probs = self.classifier.predict_proba(x_input)
         raw_probs = np.asarray(raw_probs, dtype=np.float32)
 
-        if raw_probs.shape[1] == 3:
+        if raw_probs.shape[1] == N_CLASSES:
             return raw_probs
 
-        classes = getattr(self.classifier, "classes_", np.array([0, 1, 2]))
-        aligned_probs = np.zeros((len(base_features), 3), dtype=np.float32)
+        # A model fitted without one of the classes: scatter its columns back to (H, A, D)
+        classes = getattr(self.classifier, "classes_", np.arange(N_CLASSES))
+        aligned_probs = np.zeros((len(base_features), N_CLASSES), dtype=np.float32)
         for i, c in enumerate(classes):
-            if 0 <= c < 3:
-                aligned_probs[:, c] = raw_probs[:, i]
+            if 0 <= c < N_CLASSES:
+                aligned_probs[:, int(c)] = raw_probs[:, i]
         return aligned_probs
 
     def save(self, path: str | Path) -> None:
