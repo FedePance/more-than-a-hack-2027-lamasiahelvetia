@@ -41,7 +41,7 @@ more-than-a-hack-2027-lamasiahelvetia/
 ├── external_open/                  # External open tracking data directory (git-ignored)
 │   ├── data/                       # Root for Metrica Sample Games (Sample_Game_1, 2, 3)
 │   └── .cache/                     # Fast-loading precomputed .npz archives (< 0.2 s startup)
-├── models/                         # Serialized model checkpoints (.pt and .joblib; git-ignored)
+├── models/                         # Pre-trained production checkpoints (bi_gru_full.pt, tcn_1d_full.pt)
 ├── results/                        # Generated submission CSV files (frame, label)
 ├── src/                            # Deterministic physics and kinematic pipeline
 │   ├── __init__.py                 # Core package exports
@@ -137,6 +137,7 @@ To perform Leave-One-Game-Out cross-validation or train supervised ML models fro
    │   └── Sample_Game_2_RawEventsData.csv
    └── Sample_Game_3/
        ├── Sample_Game_3_tracking.txt
+       ├── Sample_Game_3_metadata.xml
        └── Sample_Game_3_events.json
    ```
 2. On first execution, `src/ml_pipeline/dataset_open.py` automatically parses tracking files, synchronizes event ground truth, precomputes the 14 base features, and writes compressed archives to `external_open/.cache/*.npz` for instantaneous subsequent loads.
@@ -144,6 +145,18 @@ To perform Leave-One-Game-Out cross-validation or train supervised ML models fro
 ---
 
 ## 4. Usage & Reproducible Workflows
+
+### 4.0 Reproducing the Final Submission (`results/lamasia_helvetia.csv`)
+With the competition match assets placed under `./data/tactical/` (or `MTAH_DATA_DIR`), regenerate the exact submission file using the shipped pre-trained checkpoints (`models/bi_gru_full.pt` and `models/tcn_1d_full.pt`, blended 50/50 by default) and verify its format:
+
+```bash
+python src/ml_pipeline/infer_match.py \
+  --checkpoints models/bi_gru_full.pt models/tcn_1d_full.pt \
+  --hybrid-dead-ball \
+  --output results/lamasia_helvetia.csv
+
+python evaluation/validate_submission.py results/lamasia_helvetia.csv
+```
 
 ### 4.1 Running the Deterministic Physics/Heuristic Pipeline
 The deterministic physics pipeline reconstructs ball trajectories, extracts player kinematics, identifies dead-ball states via Smart Tagging and player speed percentiles, and resolves possession via a hysteresis state machine:
@@ -234,46 +247,23 @@ The script scores a fixed grid of weight pairs with the official metrics under t
 ### 4.3 Running Match Inference (`src/ml_pipeline/infer_match.py`)
 Match inference executes feature extraction on `BAR-ATH`, sliding-window neural inference, optional kinematic dead-ball fusion, and independent half-by-half Viterbi decoding.
 
-#### Single-Model Inference:
+#### Primary Hybrid Production Inference (50/50 BiGRU + 1D-TCN):
 ```bash
 python src/ml_pipeline/infer_match.py \
-  --checkpoint models/bi_gru_full.pt \
-  --output results/lamasia_helvetia_bigru.csv
-```
-
-#### Multi-Model Heterogeneous Ensemble:
-Blends class probabilities across distinct model families (e.g., BiGRU, TCN, and LightGBM) with custom weights:
-```bash
-python src/ml_pipeline/infer_match.py \
-  --checkpoints models/bi_gru_full.pt models/tcn_1d_full.pt models/lgbm_full.joblib \
-  --weights 0.40 0.30 0.30 \
-  --output results/lamasia_helvetia_hetero_ensemble.csv
-```
-
-#### LOGO 3-Fold Checkpoint Ensemble:
-Averages predictions across the 3 cross-validation fold checkpoints of a single architecture:
-```bash
-python src/ml_pipeline/infer_match.py \
-  --ensemble \
-  --arch bi_gru \
-  --models-dir models \
-  --output results/lamasia_helvetia_bigru_folds.csv
-```
-
-#### Physics + ML Hybrid Dead-Ball Fusion:
-Boosts Dead Ball (`D`) emission log-probabilities using the physical and kinematic stoppage detector:
-```bash
-python src/ml_pipeline/infer_match.py \
-  --checkpoint models/bi_gru_full.pt \
+  --checkpoints models/bi_gru_full.pt models/tcn_1d_full.pt \
   --hybrid-dead-ball \
-  --dead-ball-boost 1.5 \
-  --output results/lamasia_helvetia_hybrid.csv
+  --output results/lamasia_helvetia.csv
 ```
+When multiple checkpoints are passed without `--weights`, `infer_match.py` defaults to uniform weighting (equal 50/50 blend for two models).
 
-**Common Inference CLI Flags:**
-- `--trans-penalty-ha`: Viterbi transition log-penalty between Home and Away (default: `3.0`).
-- `--trans-penalty-dead`: Viterbi transition log-penalty between Live Play and Dead Ball (default: `2.0`).
-- `--abstain-threshold`: Probability confidence threshold below which occluded ball frames emit `X` (default: `0.45`).
+#### Optional CLI Execution Modes & Flags:
+- `--checkpoint <path>`: Run inference with a single checkpoint (e.g. `models/bi_gru_full.pt`).
+- `--ensemble --arch <arch>`: Average predictions across the 3 LOGO fold checkpoints (`models/{arch}_fold_{1,2,3}.pt`).
+- `--hybrid-dead-ball`: Fuses physical stoppage and kinematic detection with neural emissions (+1.5 log-odds boost by default).
+- `--dead-ball-boost <float>`: Additive log-score boost for frames flagged by the physical dead-ball detector (default: `1.5`).
+- `--trans-penalty-ha <float>`: Viterbi transition log-penalty between Home and Away states (default: `3.0`).
+- `--trans-penalty-dead <float>`: Viterbi transition log-penalty between Live Play and Dead Ball (default: `2.0`).
+- `--abstain-threshold <float>`: Maximum probability threshold below which occluded ball frames emit `X` (default: `0.45`).
 - `--no-abstain`: Disables selective abstention, emitting strictly `{H, A, D}`.
 
 **Argument Rules (checked before any data is loaded):**
@@ -289,7 +279,7 @@ python src/ml_pipeline/infer_match.py \
 Before submitting or evaluating any generated CSV, verify that it complies strictly with the competition submission contract:
 
 ```bash
-python evaluation/validate_submission.py results/lamasia_helvetia_physics.csv
+python evaluation/validate_submission.py results/lamasia_helvetia.csv
 ```
 
 The script verifies:
@@ -300,21 +290,16 @@ The script verifies:
 5. Strict membership of labels in the valid alphabet: `{'H', 'A', 'D', 'X'}`.
 6. Analyzes possession statistics (total spells, mean spell duration, and class balance).
 
-To score every CSV in `results/` against the public 5-minute ground truth with the official scorer:
+To score the generated submission against the public 5-minute ground truth alongside the four official baselines (`baseline_*.csv`), copy the CSV into `evaluation/results/` and run the official scorer:
 
 ```bash
-python evaluation/run_evaluation.py --results results
+cp results/lamasia_helvetia.csv evaluation/results/
+python evaluation/run_evaluation.py
 ```
 
 `--results results` is required because the scorer looks in `evaluation/results/` by default, while the pipelines in this repository write to `results/` at the repository root.
 
----
-
-## 5. Robustness & Reproducibility Guarantees
-
-- **Valid labels only:** Decoded state codes are checked before conversion to labels; a code outside `{H, A, D, X}` raises an error instead of being written. Both CLIs also run the submission contract check before saving the CSV.
-- **Halftime isolation:** Each half is processed independently. Sliding windows, LightGBM temporal features, Viterbi state, the out-of-bounds latch, and the possession state machine never cross the halftime break. Every frame outside the two halves (pre-match, halftime `90652..110807`, post-match) is written as `D`.
-- **Non-finite inputs:** Malformed tracking records are skipped, infinite coordinates are treated as missing, the feature matrix is guaranteed finite, and the Viterbi decoder replaces NaN emission rows with a uniform distribution.
-- **Deterministic decoding:** Viterbi path scores are accumulated in float64 with strict IEEE arithmetic, and ties resolve toward the lowest state index, so the Numba kernel and the NumPy fallback return the same path.
-- **Seeding:** Training, ensemble tuning, and inference seed Python, NumPy, and PyTorch and request deterministic cuDNN kernels.
-- **Checkpoint compatibility:** The 14-feature order and the `PossessionBiGRU` / `PossessionTCN1D` layer definitions are frozen; existing `.pt` checkpoints load without retraining.
+> [!NOTE]
+> **Operational & Reproducibility Notes:**
+> - First Half (`11185..90651`) and Second Half (`110808..190197`) are processed independently, while pre-match, halftime (`90652..110807`), and post-match frames are deterministically assigned `D`.
+> - Deterministic seeding and IEEE `float64` Viterbi path accumulation guarantee identical output across runs.
